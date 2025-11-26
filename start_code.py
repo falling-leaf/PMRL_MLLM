@@ -1,11 +1,17 @@
 
 import argparse
-from easyeditor import MENDMultimodalTrainingHparams, MENDMultimodalHparams, CaptionDataset, VQADataset, MultimodalTrainer
-
+import torch
+from easyeditor import MENDMultimodalTrainingHparams, WISEMultimodalHyperParams, MENDMultimodalHparams
+from easyeditor import CaptionDataset, VQADataset
+from easyeditor import MultimodalEditor, MultimodalTrainer
+from examples.run_adsedit import get_data
+# 读取数据集的索引json
 caption_train_path = '/data/jjsu/easyedit/MMEdit/editing-data/caption/caption_train_edit.json'
 caption_eval_path = '/data/jjsu/easyedit/MMEdit/editing-data/caption/caption_eval_edit.json'
 vqa_train_path = '/data/jjsu/easyedit/MMEdit/editing-data/vqa/vqa_train.json'
 vqa_eval_path = '/data/jjsu/easyedit/MMEdit/editing-data/vqa/vqa_eval.json'
+
+# 模型和数据路径
 model_path = '/model/jjsu/Model/'
 data_path = '/data/jjsu/easyedit/MMEdit/'
 
@@ -13,18 +19,21 @@ def apply_mend_method(args):
     # 加载训练配置
     if args.model == 'blip2':
         training_hparams = MENDMultimodalTrainingHparams.from_hparams('./hparams/TRAINING/MEND/blip2.yaml')
+        training_hparams.name = model_path + 'opt-2.7b'
+        training_hparams.tokenizer_name = model_path + 'opt-2.7b'
+        training_hparams.qformer_checkpoint = model_path + 'blip2_pretrained_opt2.7b.pth'
+        training_hparams.state_dict_file = model_path + 'eva_vit_g.pth'
     elif args.model == 'qwen':
         training_hparams = MENDMultimodalTrainingHparams.from_hparams('./hparams/TRAINING/MEND/qwen2vl-7b.yaml')
     elif args.model == 'minigpt4':
         training_hparams = MENDMultimodalTrainingHparams.from_hparams('./hparams/TRAINING/MEND/minigpt4.yaml')
+        training_hparams.name = model_path + 'Vicuna'
+        training_hparams.tokenizer_name = model_path + 'Vicuna'
+        training_hparams.qformer_checkpoint = model_path + 'blip2_pretrained_flant5xxl.pth'
+        training_hparams.state_dict_file = model_path + 'eva_vit_g.pth'
+        training_hparams.pretrained_ckpt = model_path + 'pretrained_minigpt4_7b.pth'
     else:
         raise ValueError(f"Unknown model configuration: {args.model}")
-    training_hparams.name = model_path + 'opt-2.7b'
-    training_hparams.tokenizer_name = model_path + 'opt-2.7b'
-    training_hparams.qformer_checkpoint = model_path + 'blip2_pretrained_opt2.7b.pth'
-    # 下面这条逻辑被写死了
-    # training_hparams.qformer_name_or_path = model_path + 'bert-base-uncased'
-    training_hparams.state_dict_file = model_path + 'eva_vit_g.pth'
     training_hparams.coco_image = data_path
     training_hparams.rephrase_image = data_path
     # 设置设备
@@ -48,6 +57,51 @@ def apply_mend_method(args):
         val_set=eval_ds
     )
     trainer.run()
+
+def apply_wise_method(args):
+    # 加载训练配置
+    if args.model == 'blip2':
+        raise ValueError(f"Unknown model configuration: {args.model}")
+    elif args.model == 'minigpt4':
+        raise ValueError(f"Unknown model configuration: {args.model}")
+    elif args.model == 'qwen':
+        raise ValueError(f"Unknown model configuration: {args.model}")
+    elif args.model == 'llava':
+        hparams = WISEMultimodalHyperParams.from_hparams('./hparams/WISE/llavaov-7b.yaml')
+        hparams.model_name = model_path + "llava-onevision-qwen2-7b-ov-hf"
+        hparams.dtype = torch.bfloat16
+    else:
+        raise ValueError(f"Unknown model configuration: {args.model}")
+    hparams.coco_image = data_path
+    hparams.rephrase_image = data_path
+    # 设置设备
+    hparams.device = int(args.device)
+    hparams.sub_device = int(args.sub_device)
+
+    if args.ds == 'caption':
+        train_ds = CaptionDataset(caption_train_path, config=hparams)
+    elif args.ds == 'vqa':
+        train_ds = VQADataset(vqa_train_path, config=hparams)
+    else:
+        raise ValueError(f"Unknown dataset type: {args.ds}")
+    
+    editor = MultimodalEditor.from_hparams(hparams)
+    metrics, edited_model, _ = editor.edit_dataset(
+        train_ds,
+        keep_original_weight=False,
+        verbose=True
+    )
+    acc = 0
+    gen = 0
+    t_loc = 0
+    i_loc = 0
+    for case in metrics:
+        acc += case["post"]["rewrite_acc"].item()
+        gen += case["post"]["image_rephrase_acc"].item()
+        t_loc += case["post"]["locality_acc"].item()
+        i_loc += case["post"]["multimodal_locality_acc"].item()
+    print("-------------------- Final Results -------------------")
+    print(f"Rewrite Acc: {acc/len(metrics)}, Rephrase Acc: {gen/len(metrics)}, Text Loc Acc: {t_loc/len(metrics)}, Image Loc Acc: {i_loc/len(metrics)}")
 
 
 def main():
@@ -78,6 +132,8 @@ def main():
 
     if args.method == 'mend':
         apply_mend_method(args)
+    elif args.method == 'wise':
+        apply_wise_method(args)
     else:
         raise ValueError(f"Unknown editing method: {args.method}")
 

@@ -273,9 +273,9 @@ def multimodal_tokenize(batch, processor, device, context_templates=None, hparam
     tokens = {key: val.to(device) for key, val in tokens.items()}
 
     if file_type in ["image", "single-image", "multi-image"]:
-        multimodal_inputs = processor(images=input_images, text=full_prompt, return_tensors="pt", padding=True).to(device, dtype=torch.float32)
+        multimodal_inputs = processor(images=input_images, text=full_prompt, return_tensors="pt", padding=True).to(device, dtype=hparams.dtype)
     elif file_type == "video":
-        multimodal_inputs = processor(videos=input_images[0], text=full_prompt, return_tensors="pt", padding=True).to(device, dtype=torch.float32)
+        multimodal_inputs = processor(videos=input_images[0], text=full_prompt, return_tensors="pt", padding=True).to(device, dtype=hparams.dtype)
         
     last_prompt_token_loc = (tokens["labels"] == -100).sum(dim=-1)[0]
     last_ans_token_loc = (tokens["labels"] == processor.tokenizer.pad_token_id).sum(dim=-1)[0]

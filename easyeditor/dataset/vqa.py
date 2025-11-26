@@ -10,12 +10,14 @@ from collections import OrderedDict
 
 from .processor.base_dataset import BaseDataset
 from .processor.blip_processors import BlipImageEvalProcessor
+from .processor.llavaov_processors import LLaVAOneVisionProcessor
 from ..trainer.utils import dict_to
 from PIL import Image
 import random
 import typing
 import torch
 import transformers
+from transformers import AutoProcessor
 
 class VQADataset(BaseDataset):
     def __init__(self, data_dir: str, size:  typing.Optional[int] = None, config=None, *args, **kwargs):
@@ -24,18 +26,24 @@ class VQADataset(BaseDataset):
         ann_root (string): directory to store the annotation file
         """
         # get tokenizer and vis_processor
-        vis_processor = BlipImageEvalProcessor(image_size=364, mean=None, std=None)
-        if (config is not None and hasattr(config, 'tokenizer_name')):
-            tok_name = (
-                config.tokenizer_name
-                if config.tokenizer_name is not None
-                else config.name
-            )
-            tokenizer = getattr(transformers, config.tokenizer_class).from_pretrained(
-                tok_name, trust_remote_code=True
-            )            
-            if tokenizer.pad_token == None or tokenizer.pad_token == '':
-                tokenizer.pad_token = tokenizer.eos_token  
+        if config.model_name == "blip2" or config.model_name == "minigpt4":
+            vis_processor = BlipImageEvalProcessor(image_size=384, mean=None, std=None)
+            if (config is not None and hasattr(config, 'tokenizer_name')):
+                tok_name = (
+                    config.tokenizer_name
+                    if config.tokenizer_name is not None
+                    else config.name
+                )
+                tokenizer = getattr(transformers, config.tokenizer_class).from_pretrained(
+                    tok_name, trust_remote_code=True
+                )            
+                if tokenizer.pad_token == None or tokenizer.pad_token == '':
+                    tokenizer.pad_token = tokenizer.eos_token  
+        elif "llava-onevision" in config.model_name.lower():  
+            vis_processor = LLaVAOneVisionProcessor()
+            tokenizer = AutoProcessor.from_pretrained(config.model_name)
+        else:
+            raise ValueError(f"Unknown model configuration: {config.model_name}")
                 
         vis_root = config.coco_image
         rephrase_root = config.rephrase_image
@@ -51,6 +59,8 @@ class VQADataset(BaseDataset):
         if size is not None:
             self.annotation = self.annotation[:size]  
         for i, record in enumerate(self.annotation):
+            if i == 20:
+                break
             
             if record['alt'] == "":
                 continue
@@ -59,13 +69,13 @@ class VQADataset(BaseDataset):
             rephrase_image_path = os.path.join(self.rephrase_root, record["image_rephrase"])
             locality_image_path = os.path.join(self.vis_root, record['m_loc'])
             
-            image = Image.open(image_path).convert("RGB")
-            rephrase_image = Image.open(rephrase_image_path).convert("RGB")
-            locality_image = Image.open(locality_image_path).convert("RGB")
+            # image = Image.open(image_path).convert("RGB")
+            # rephrase_image = Image.open(rephrase_image_path).convert("RGB")
+            # locality_image = Image.open(locality_image_path).convert("RGB")
 
-            image = self.vis_processor(image)
-            rephrase_image = self.vis_processor(rephrase_image)  
-            locality_image = self.vis_processor(locality_image)  
+            image = self.vis_processor(image_path, file_type="image")
+            rephrase_image = self.vis_processor(rephrase_image_path, file_type="image")  
+            locality_image = self.vis_processor(locality_image_path, file_type="image")  
                       
             item = {
                 'prompt': record['src'],
@@ -87,6 +97,7 @@ class VQADataset(BaseDataset):
             item['multimodal_locality_image'] = locality_image
             item['multimodal_locality_prompt'] = record['m_loc_q']
             item['multimodal_locality_ground_truth'] = record['m_loc_a']
+            item['file_type'] = "image"
             data.append(item)
             
         # if size is not None:

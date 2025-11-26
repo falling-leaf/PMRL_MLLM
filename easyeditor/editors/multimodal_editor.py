@@ -138,7 +138,7 @@ class MultimodalEditor:
             elif "llava-onevision" in hparams.model_name.lower():   
                 self.model = LlavaOnevisionForConditionalGeneration.from_pretrained(
                     hparams.model_name,
-                    torch_dtype=torch.float32,
+                    torch_dtype=hparams.dtype,
                     # attn_implementation="flash_attention_2" 
                 )
                 self.vis_tok = LLaVAOneVisionProcessor()
@@ -446,7 +446,7 @@ class MultimodalEditor:
                 edited_model, weights_copy = self.apply_algo(
                     self.model,
                     self.tok,
-                    request,
+                    [request],
                     self.hparams,
                     copy=False,
                     return_orig_weights=True,
@@ -466,15 +466,34 @@ class MultimodalEditor:
                                                         request, self.hparams.device, pre_edit=True)
                 }
             else:
-                metrics = {
-                    'case_id': i,
-                    # "requested_rewrite": request,
-                    "time": exec_time,
-                    "post": compute_multimodal_edit_results(edited_model, self.model_name, self.hparams, self.tok,
-                                                        request, self.hparams.device),
-                    "pre": compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
-                                                        request, self.hparams.device)
-                }
+                if self.model_name in ['minigpt4', 'blip2']:
+                    metrics = {
+                        'case_id': i,
+                        "time": exec_time,
+                        "post": compute_multimodal_edit_results(edited_model, self.model_name, self.hparams, self.tok,
+                                                            request, self.hparams.device),
+                        "pre": compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
+                                                            request, self.hparams.device)
+                    }
+                elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                    metrics = {
+                        'case_id': i,
+                        # "requested_rewrite": request,
+                        "time": exec_time,
+                        "post": compute_multimodal_hf_edit_results(edited_model, self.model_name, self.hparams, self.tok,
+                                                            request, self.hparams.device),
+                        "pre": compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
+                                                            request, self.hparams.device),
+                    }   
+                # metrics = {
+                #     'case_id': i,
+                #     # "requested_rewrite": request,
+                #     "time": exec_time,
+                #     "post": compute_multimodal_edit_results(edited_model, self.model_name, self.hparams, self.tok,
+                #                                         request, self.hparams.device),
+                #     "pre": compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
+                #                                         request, self.hparams.device)
+                # }
             if 'locality_output' in metrics['post'].keys():
                 assert len(metrics['post']['locality_output']) == \
                         len(metrics['pre']['locality_output'])
