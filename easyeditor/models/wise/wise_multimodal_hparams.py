@@ -42,6 +42,9 @@ class WISEMultimodalHyperParams(HyperParams):
     device: int
     alg_name: str
     model_name: str
+    name: str
+    tokenizer_class: str
+    tokenizer_name: str
 
     # Defaults
     batch_size: int = 1

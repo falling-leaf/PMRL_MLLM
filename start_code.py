@@ -61,7 +61,11 @@ def apply_mend_method(args):
 def apply_wise_method(args):
     # 加载训练配置
     if args.model == 'blip2':
-        raise ValueError(f"Unknown model configuration: {args.model}")
+        hparams = WISEMultimodalHyperParams.from_hparams('./hparams/WISE/blip2.yaml')
+        hparams.name = model_path + 'opt-2.7b'
+        hparams.tokenizer_name = model_path + "opt-2.7b"
+        hparams.qformer_checkpoint = model_path + 'blip2_pretrained_opt2.7b.pth'
+        hparams.state_dict_file = model_path + 'eva_vit_g.pth'
     elif args.model == 'minigpt4':
         raise ValueError(f"Unknown model configuration: {args.model}")
     elif args.model == 'qwen':

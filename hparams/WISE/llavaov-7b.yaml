@@ -1,5 +1,9 @@
 alg_name: "WISE"
 model_name: "./hugging_cache/llava-onevision-qwen2-7b-ov-hf"
+name: .
+tokenizer_class: .
+tokenizer_name: .
+
 
 device: 0
 
