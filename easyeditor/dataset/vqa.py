@@ -27,7 +27,7 @@ class VQADataset(BaseDataset):
         """
         # get tokenizer and vis_processor
         if config.model_name == "blip2" or config.model_name == "minigpt4":
-            vis_processor = BlipImageEvalProcessor(image_size=384, mean=None, std=None)
+            vis_processor = BlipImageEvalProcessor(image_size=364, mean=None, std=None)
             if (config is not None and hasattr(config, 'tokenizer_name')):
                 tok_name = (
                     config.tokenizer_name
@@ -42,6 +42,17 @@ class VQADataset(BaseDataset):
         elif "llava-onevision" in config.model_name.lower():  
             vis_processor = LLaVAOneVisionProcessor()
             tokenizer = AutoProcessor.from_pretrained(config.model_name)
+        elif (config is not None and hasattr(config, 'tokenizer_name')):
+            tok_name = (
+                config.tokenizer_name
+                if config.tokenizer_name is not None
+                else config.name
+            )
+            tokenizer = getattr(transformers, config.tokenizer_class).from_pretrained(
+                tok_name, trust_remote_code=True
+            )            
+            if tokenizer.pad_token == None or tokenizer.pad_token == '':
+                tokenizer.pad_token = tokenizer.eos_token  
         else:
             raise ValueError(f"Unknown model configuration: {config.model_name}")
                 

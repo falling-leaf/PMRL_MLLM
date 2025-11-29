@@ -32,6 +32,8 @@ def euc(query, key, config, act_mask=None, infer=False):
 
     act_fn = ACT2FN[config.hidden_act]
     l2_norm = torch.norm(act_fn(key) - act_fn(query), dim=-1)
+    if l2_norm.dim() == 1:
+        l2_norm = l2_norm.unsqueeze(0)
     if infer and l2_norm.size(1) > 100:
         topk = torch.topk(l2_norm, k=1, largest=True)
         return topk.values.mean()
@@ -84,16 +86,28 @@ class WISE(torch.nn.Module):
         gc.collect()
 
     # Forward
-    def __call__(self, **kwargs):
+    def __call__(self, *args, **kwargs):
         if not self.config.retrieve:
-            if hasattr(self.get_adapter_layer(), 'editing') and not self.get_adapter_layer().editing:
-                # final merge
-                if not self.get_adapter_layer().original_layer.weight.equal(self.get_adapter_layer().new_weight) and self.get_adapter_layer().editing_total_cnt >= self.config.save_freq:
-                    self.get_adapter_layer().memory_weight.append(self.get_adapter_layer().new_weight)
-                if len(self.get_adapter_layer().memory_weight) > 0 and self.get_adapter_layer().editing_total_cnt >= self.config.save_freq:
-                    print('length of memory is ', len(self.get_adapter_layer().memory_weight), '!!!!!!')
-                    self.get_adapter_layer().merge_weight()
-        return self.model(**kwargs)
+            adapter = self.get_adapter_layer()
+            if hasattr(adapter, 'editing') and not adapter.editing:
+                if (not adapter.original_layer.weight.equal(adapter.new_weight)
+                        and adapter.editing_total_cnt >= self.config.save_freq):
+                    adapter.memory_weight.append(adapter.new_weight)
+
+                if len(adapter.memory_weight) > 0 and adapter.editing_total_cnt >= self.config.save_freq:
+                    print('length of memory is ', len(adapter.memory_weight), '!!!!!!')
+                    adapter.merge_weight()
+        # 1. 如果用户传入 model(batch)
+        if len(args) == 1 and isinstance(args[0], dict):
+            print(args[0])
+            return self.model(args[0])
+        # 2. 如果用户传入 model(batch=batch)
+        elif "batch" in kwargs and isinstance(kwargs["batch"], dict):
+            batch = kwargs.pop("batch")
+            return self.model(**batch, **kwargs)
+        # 3. 普通 HuggingFace 风格，如 model(input_ids=..., pixel_values=...)
+        else:
+            return self.model(**kwargs)
 
     def reset_layer(self):
         layer = getattr(self.edit_module, self.layer_name)
@@ -632,10 +646,17 @@ class WISEMultimodal(WISE):
         if k != 1:
             raise AssertionError("Not support Batch Edit")
         
-        bs = text_tokens["input_ids"].shape[0] - k
-        logits = self.model(**multimodal_inputs).logits
-        shift_logits = logits[:-k, :-1, :].contiguous()
-        shift_labels = multimodal_inputs['input_ids'][:-k, 1:].contiguous()
+        if self.config.model_name == "blip2" or self.config.model_name == "minigpt4":
+            logits = self.model(multimodal_inputs).logits
+            labels = text_tokens["labels"]
+            shift_labels = labels[:, 1:]
+            shift_logits = logits[:, :-1, :]
+            bs = text_tokens["labels"].shape[0]
+        else: 
+            logits = self.model(**multimodal_inputs).logits
+            shift_labels = multimodal_inputs['input_ids'][:-k, 1:].contiguous()
+            shift_logits = logits[:-k, :-1, :].contiguous()
+            bs = text_tokens["input_ids"].shape[0] - k
         # only cal loss of target text tokens
         loss_fct = CrossEntropyLoss(reduction='none')
         a = shift_logits.view(-1, shift_logits.size(-1))
