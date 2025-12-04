@@ -1,5 +1,8 @@
 alg_name: "WISE"
 model_name: "./hugging_cache/qwen2-vl-7b"
+name: .
+tokenizer_class: .
+tokenizer_name: .
 
 device: 0
 
@@ -42,7 +45,8 @@ hidden_act: silu
 qformer_checkpoint: .
 qformer_name_or_path: .
 state_dict_file: .
+pretrained_ckpt: .
 # image
-file_type: video
+file_type: image
 coco_image: ../
 rephrase_image: ../

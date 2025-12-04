@@ -443,6 +443,17 @@ class MultimodalEditor:
                     train_ds=kwargs['train_ds']
                 )
             else:
+                # fixbug：COPY=False时，此处执行apply_algo前后self.model被修改，但Pre计算会引入wiseadapter的计算
+                # 这会导致acc, gen在pre中就已经是1了，并不符合实际（实际由于随机性，会有一定的正确率，但不会是1）
+                # 这也意味着当前方法其实是在sequential_edit场景下实现的single_edit评测，逻辑似乎有问题
+                # 最好的解决方式是：将WISE初始化中【替换编辑层】的操作加一个if判断是single还是sequential需求
+                # 这样既不占用额外显存，也没有逻辑上的漏洞
+                if self.model_name in ['minigpt4', 'blip2']:
+                    pre_res = compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
+                                                            request, self.hparams.device)
+                elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                    pre_res = compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
+                                                            request, self.hparams.device)
                 edited_model, weights_copy = self.apply_algo(
                     self.model,
                     self.tok,
@@ -472,8 +483,7 @@ class MultimodalEditor:
                         "time": exec_time,
                         "post": compute_multimodal_edit_results(edited_model, self.model_name, self.hparams, self.tok,
                                                             request, self.hparams.device),
-                        "pre": compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
-                                                            request, self.hparams.device)
+                        "pre": pre_res
                     }
                 elif self.model_name in ['llava-onevision', 'qwen2-vl']:
                     metrics = {
@@ -482,8 +492,7 @@ class MultimodalEditor:
                         "time": exec_time,
                         "post": compute_multimodal_hf_edit_results(edited_model, self.model_name, self.hparams, self.tok,
                                                             request, self.hparams.device),
-                        "pre": compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
-                                                            request, self.hparams.device),
+                        "pre": pre_res
                     }   
                 # metrics = {
                 #     'case_id': i,
@@ -667,7 +676,7 @@ class MultimodalEditor:
                         'multimodal_locality_ground_truth': multimodal_locality_ground_truth[i],
                     }
                 )
-        
+        # TODO: 同utils/multimodal_tokenize，loc_prompts应该和locality_inputs不同？
         if 'loc_prompts' in kwargs:
             if isinstance(kwargs['loc_prompts'], str):
                 kwargs['loc_prompts'] = [kwargs['loc_prompts'],]

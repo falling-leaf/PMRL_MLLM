@@ -11,6 +11,7 @@ class WISEMultimodalHyperParams(HyperParams):
     qformer_checkpoint: str
     state_dict_file: str
     hidden_act: str
+    pretrained_ckpt: str
     
     # Image_dir
     file_type: str # single image or video
