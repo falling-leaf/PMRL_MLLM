@@ -99,7 +99,6 @@ class WISE(torch.nn.Module):
                     adapter.merge_weight()
         # 1. 如果用户传入 model(batch)
         if len(args) == 1 and isinstance(args[0], dict):
-            print(args[0])
             return self.model(args[0])
         # 2. 如果用户传入 model(batch=batch)
         elif "batch" in kwargs and isinstance(kwargs["batch"], dict):
@@ -271,7 +270,23 @@ class WISE(torch.nn.Module):
         else:
             k = 1
         total_loss = []
+        # print("Input dim:", self.get_adapter_layer().weight.shape[1])
+        # print("Output dim:", self.get_adapter_layer().weight.shape[0])
+        # print("original_layer_output_shape: ", original_layer_output.shape)
+        # print("new_weight_layer_output: ", new_weight_layer_output.shape)
+        if self.config.model_name == "blip2":
+            original_layer_output = original_layer_output.reshape(2, -1, original_layer_output.size(-1))
+            new_weight_layer_output = new_weight_layer_output.reshape(2, -1, new_weight_layer_output.size(-1))
+        # TODO: 此处逻辑并不理解：len_temp在原逻辑中计算的似乎是有关batch大小的内容
+        # 而在后续计算dist时，将len_temp作为划分output[0]的基准（该基准在llava, qwen中均表现为batch大小）
+        # 现在，llava和qwen对于output的取值分别为[batch, seq, dim], batch=2
+        # loc样本在这里用于计算out_scope_dist
+        # 并且由于act_mask本身不奏效，整个循环仅会执行一次（act_mask值为[None]）
         len_temp = original_layer_output.shape[0] / k - 1
+        # if len_temp == 0:
+        #     len_temp = 1
+        # print(len_temp)
+        # print(act_mask)
         for i,act_mk in enumerate(act_mask):
             if act_mk is not None:
                 in_scope_dist = euc(original_layer_output[int(i*len_temp):int((i+1)*len_temp), ...], new_weight_layer_output[int(i*len_temp):int((i+1)*len_temp), ...], config,
@@ -284,7 +299,8 @@ class WISE(torch.nn.Module):
                     out_scope_dist = euc(original_layer_output[int(i-k):, ...], new_weight_layer_output[int(i-k):, ...], config)
                 else:
                     out_scope_dist = euc(original_layer_output[int(i-k):int(i+1-k), ...], new_weight_layer_output[int(i-k):int(i+1-k), ...], config)
-
+                # print("in_scope_dist: ", in_scope_dist)
+                # print("out_scope_dist: ", out_scope_dist)
             loss = out_scope_dist.view(-1,1) - in_scope_dist + config.gamma
             loss2 = out_scope_dist - config.alpha
             loss3 = config.beta - in_scope_dist
@@ -553,8 +569,12 @@ class WISEMultimodal(WISE):
             ft_loss = self._cal_ft_loss(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len)
 
             act_loss = super()._cal_activation_loss(super().get_adapter_layer().original_layer_output, super().get_adapter_layer().new_weight_layer_output,
-                                                  config=config, act_mask=act_mask, deact_mask=deact_mask)
+                                                    config=config, act_mask=act_mask, deact_mask=deact_mask)
             loss = ft_loss + act_loss.to(ft_loss.device)
+            if self.config.model_name == "blip2":
+                print(self.model.generate(multimodal_inputs[0]))
+            # elif self.config.model_name == "minigpt4":
+            #     print(self.model.predict_answers(multimodal_inputs))
 
             if loss_meter.stop():
                 super().get_adapter_layer().save_editing_activation()  # add last gradient
@@ -638,6 +658,8 @@ class WISEMultimodal(WISE):
             print(f'Merge Weight of (New, Original) Matrix... with {self.config.merge_alg}')
 
     def _cal_ft_loss(self, multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len):
+        # TODO: 前后矛盾，传入的是两个样本，但是处理时k强制为1，后续也将loc这个样本的训练直接用k割掉了
+        # 因此，这里的blip2和minigpt4传入的是一个样本（即acc）
         if hasattr(self.model.config, 'batch_size'):
             k = self.config.batch_size
         else:
@@ -649,11 +671,12 @@ class WISEMultimodal(WISE):
         if self.config.model_name == "blip2" or self.config.model_name == "minigpt4":
             logits = self.model(multimodal_inputs).logits
             labels = text_tokens["labels"]
-            shift_labels = labels[:, 1:]
-            shift_logits = logits[:, :-1, :]
+            shift_labels = labels[:, 1:].contiguous()
+            shift_logits = logits[:-k, :-1, :].contiguous()
             bs = text_tokens["labels"].shape[0]
         else: 
             logits = self.model(**multimodal_inputs).logits
+            # 这里事实上是将acc和loc放在了两个batch上，然后来跑
             shift_labels = multimodal_inputs['input_ids'][:-k, 1:].contiguous()
             shift_logits = logits[:-k, :-1, :].contiguous()
             bs = text_tokens["input_ids"].shape[0] - k
@@ -661,10 +684,16 @@ class WISEMultimodal(WISE):
         loss_fct = CrossEntropyLoss(reduction='none')
         a = shift_logits.view(-1, shift_logits.size(-1))
         b = shift_labels.view(-1)[-ans_token_len:]
+        # print("logits shape: ", logits.shape)
+        # print("shift_label shape:", shift_labels.shape)
+        # print("shift_logits shape:", shift_logits.shape)
+        # print("bs ", bs)
+        # print("a shape:", a.shape)
+        # print("b shape:", b.shape)
         a = a[-b.size(0):,:]
+        # print("a modified shape: ", a.shape)
         loss = loss_fct(a, b)
         loss = loss.view(bs, -1)
         label_mask = torch.ones_like(loss, dtype=torch.bool)        
         ft_loss = ((loss * label_mask).sum(1) / label_mask.sum(1)).mean()
         return ft_loss
-    

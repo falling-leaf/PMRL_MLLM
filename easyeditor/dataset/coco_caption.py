@@ -11,6 +11,7 @@ from collections import OrderedDict
 from .processor.base_dataset import BaseDataset
 from .processor.blip_processors import BlipImageEvalProcessor
 from .processor.llavaov_processors import LLaVAOneVisionProcessor
+from .processor.qwen2vl_processors import Qwen2VLProcessor
 from ..trainer.utils import dict_to
 from PIL import Image
 import random
@@ -41,6 +42,9 @@ class CaptionDataset(BaseDataset):
                     tokenizer.pad_token = tokenizer.eos_token  
         elif "llava-onevision" in config.model_name.lower():  
             vis_processor = LLaVAOneVisionProcessor()
+            tokenizer = AutoProcessor.from_pretrained(config.model_name)
+        elif "qwen2-vl" in config.model_name.lower():
+            vis_processor = Qwen2VLProcessor()
             tokenizer = AutoProcessor.from_pretrained(config.model_name)
         elif (config is not None and hasattr(config, 'tokenizer_name')):
             tok_name = (

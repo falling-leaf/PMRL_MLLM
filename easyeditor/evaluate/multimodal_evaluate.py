@@ -217,6 +217,9 @@ def prepare_multimodal_hf_edit(hparams,
                                             add_generation_prompt=True,
                                             tokenize=False) + l
                         for p, l in zip(prompts, targets)]
+        if "qwen2-vl" in hparams.model_name.lower() and "|vision_start|" not in text_input[0]:
+            image_token = "<|vision_start|><|image_pad|><|vision_end|>"       
+            text_input = [image_token + text_input[0]]
     else:
         raise AssertionError("Not support file type: {}".format(file_type))
     

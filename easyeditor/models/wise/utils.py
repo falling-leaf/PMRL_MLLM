@@ -163,18 +163,26 @@ def blip2_multimodal_tokenize(batch, processor, device, context_templates=None, 
     else:
         tok = processor
 
-    if hparams is not None and getattr(hparams, "model_name", "").lower() in ["minigpt4", "blip2"]:
-        edit_inner['prompts_len'] = [len(tok.encode(s, add_special_tokens=False)) for s in prompts]
-        edit_inner['labels'] = tok(labels, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
-    else:
-        edit_inner['prompts_len'] = [len(tok.encode(s)) for s in prompts]
-        edit_inner['labels'] = tok(labels, return_tensors="pt")["input_ids"].to(device)
+    edit_inner['prompts_len'] = [len(tok.encode(s, add_special_tokens=False)) for s in prompts]
+    edit_inner['labels'] = tok(labels, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
+
+    # ------------------ 构建edit_loc ------------------------------
+    edit_loc = {}
+    edit_loc['image'] = None
+
+    # text_input = prompt + target
+    edit_loc['text_input'] = [p + " " + l for p, l in zip(loc_prompts, loc_prompts_labels)]
+    edit_loc['labels_text'] = loc_prompts_labels  # 先保留原始文本形式
+
+    edit_loc['prompts_len'] = [len(tok.encode(s, add_special_tokens=False)) for s in loc_prompts]
+    edit_loc['labels'] = tok(loc_prompts_labels, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
 
     # ------------------ locality act/deact masks ------------------
     encoding = tok(edit_inner['text_input'], return_tensors="pt", padding=True, truncation=True)
     tokens = encoding
     tokens["labels"] = tokens["input_ids"].clone()
     mask_token = -100
+    # print("tokens: ", tokens)
 
     for i, plen in enumerate(edit_inner['prompts_len']):
         if plen < tokens["labels"].size(1):
@@ -182,6 +190,7 @@ def blip2_multimodal_tokenize(batch, processor, device, context_templates=None, 
         else:
             # 避免 plen 超过序列长度导致全 mask
             tokens["labels"][i, :] = mask_token
+    # print("tokens: ", tokens)
 
     # num_prompt_toks = [len(ids) for ids in encoding["input_ids"]]
     # if hparams is not None and getattr(hparams, "objective_optimization", None) == 'only_label':
@@ -221,13 +230,15 @@ def blip2_multimodal_tokenize(batch, processor, device, context_templates=None, 
     # ------------------ ans_token_len ------------------
     last_prompt_token_loc = (tokens["labels"] == -100).sum(dim=-1)[0]
     last_ans_token_loc = (tokens["labels"] == tok.pad_token_id).sum(dim=-1)[0]
+    # print(last_prompt_token_loc, last_ans_token_loc)
     ans_token_len = tokens["labels"].size(1) - last_prompt_token_loc - last_ans_token_loc
-
-    return edit_inner, tokens, ans_token_len, act_masks, deact_masks
+    multimodal_inputs = [edit_inner, edit_loc]
+    return multimodal_inputs, tokens, ans_token_len, act_masks, deact_masks
 
 
 def multimodal_tokenize(batch, processor, device, context_templates=None, hparams=None):
     # Initialize lists to store the processed data from each batch entry
+    # TODO: locality_prompt(Unrelated Knowledge) is not equal to loc_prompt(Subject phrase)!
     len_temp = 1
     prompts = [item['prompt'] for item in batch]
     input_images = [item['image'] for item in batch]
@@ -274,32 +285,40 @@ def multimodal_tokenize(batch, processor, device, context_templates=None, hparam
                 num_images = len(input_images[0])
             else:
                 num_images = 1
-            
-            temp_prompt = [processor.apply_chat_template([
-                                    {
+            if "qwen2-vl" in hparams.model_name.lower():
+                image_token = "<|vision_start|><|image_pad|><|vision_end|>"
+                temp_prompt = [image_token + p + " " + l for p, l in zip(prompts, labels)]
+                # 事实上此处prompt_ids仅作为计算答案长度用
+                prompt_ids = processor.tokenizer([image_token + p for p in prompts], return_tensors="pt", padding=True, truncation=True)["input_ids"]
+                # print("temp_prompt: ", temp_prompt)
+                # print("prompt_ids", prompt_ids)
 
-                                        "role": "user",
-                                        "content": [{"type": "image"}] * num_images + [{"type": "text", "text": p}],
-                                    },
-                                ],
-                                                add_generation_prompt=True,
-                                                tokenize=False)  + l
-                            for p, l in zip(prompts, labels)]
-            
-            prompt_ids = processor.tokenizer(
-            [processor.apply_chat_template([
-                            {
 
-                                "role": "user",
-                                "content": [
-                                    [{"type": "image"}] * num_images + [{"type": "text", "text": p}]
+            else:
+                temp_prompt = [processor.apply_chat_template([
+                                        {
+
+                                            "role": "user",
+                                            "content": [{"type": "image"}] * num_images + [{"type": "text", "text": p}],
+                                        },
                                     ],
-                            },
-                        ],
-                                    add_generation_prompt=True,
-                                    tokenize=False) for p in prompts], return_tensors="pt", padding=True, truncation=True)["input_ids"]
-            
-            print(temp_prompt)            
+                                                    add_generation_prompt=True,
+                                                    tokenize=False)  + l
+                                for p, l in zip(prompts, labels)]
+                
+                prompt_ids = processor.tokenizer(
+                [processor.apply_chat_template([
+                                {
+
+                                    "role": "user",
+                                    "content": [
+                                        [{"type": "image"}] * num_images + [{"type": "text", "text": p}]
+                                        ],
+                                },
+                            ],
+                                        add_generation_prompt=True,
+                                        tokenize=False) for p in prompts], return_tensors="pt", padding=True, truncation=True)["input_ids"]
+            print("prompt with template: ", temp_prompt)     
         else:
             raise AssertionError("Not support file type: {}".format(file_type))
         
@@ -328,7 +347,9 @@ def multimodal_tokenize(batch, processor, device, context_templates=None, hparam
     if hparams.objective_optimization == 'only_label':
         for i in range(len(num_prompt_toks)):
             tokens["labels"][i][:num_prompt_toks[i]] = mask_token
-
+    
+    # print(tokens["input_ids"])
+    # print(tokens["labels"])
     act_masks = []
     deact_masks = []
     # Iterate through each batch entry and compute act_mask, deact_mask
@@ -369,6 +390,7 @@ def multimodal_tokenize(batch, processor, device, context_templates=None, hparam
     last_prompt_token_loc = (tokens["labels"] == -100).sum(dim=-1)[0]
     last_ans_token_loc = (tokens["labels"] == processor.tokenizer.pad_token_id).sum(dim=-1)[0]
     ans_token_len = len(tokens["labels"][0]) - last_prompt_token_loc - last_ans_token_loc
+    # print(last_prompt_token_loc, last_ans_token_loc, ans_token_len)
     
     return multimodal_inputs, tokens, ans_token_len, act_masks, deact_masks
 

@@ -46,6 +46,7 @@ hidden_act: silu
 qformer_checkpoint: .
 qformer_name_or_path: .
 state_dict_file: .
+pretrained_ckpt: .
 # image
 file_type: video
 coco_image: ../

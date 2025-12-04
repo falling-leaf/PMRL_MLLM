@@ -67,9 +67,16 @@ def apply_wise_method(args):
         hparams.qformer_checkpoint = model_path + 'blip2_pretrained_opt2.7b.pth'
         hparams.state_dict_file = model_path + 'eva_vit_g.pth'
     elif args.model == 'minigpt4':
-        raise ValueError(f"Unknown model configuration: {args.model}")
+        hparams = WISEMultimodalHyperParams.from_hparams('./hparams/WISE/minigpt4.yaml')
+        hparams.name = model_path + 'Vicuna'
+        hparams.tokenizer_name = model_path + 'Vicuna'
+        hparams.qformer_checkpoint = model_path + 'blip2_pretrained_flant5xxl.pth'
+        hparams.state_dict_file = model_path + 'eva_vit_g.pth'
+        hparams.pretrained_ckpt = model_path + 'pretrained_minigpt4_7b.pth'
     elif args.model == 'qwen':
-        raise ValueError(f"Unknown model configuration: {args.model}")
+        hparams = WISEMultimodalHyperParams.from_hparams('./hparams/WISE/qwen2vl-7b.yaml')
+        hparams.model_name = model_path + "qwen2-vl-7b"
+        hparams.dtype = torch.bfloat16
     elif args.model == 'llava':
         hparams = WISEMultimodalHyperParams.from_hparams('./hparams/WISE/llavaov-7b.yaml')
         hparams.model_name = model_path + "llava-onevision-qwen2-7b-ov-hf"
