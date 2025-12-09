@@ -19,7 +19,6 @@ objective_optimization: 'only_label'
 # inner_params: 挑选 BLIP-2 下游 LM 的 MLP 层
 inner_params:
 - opt_model.model.decoder.layers[23].fc1.weight
-- opt_model.model.decoder.layers[23].fc2.weight
 
 ## alternative: WISE-Merge, WISE-Retrieve
 densities: 0.53

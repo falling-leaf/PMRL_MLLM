@@ -14,6 +14,9 @@ vqa_eval_path = '/data/jjsu/easyedit/MMEdit/editing-data/vqa/vqa_eval.json'
 # 模型和数据路径
 model_path = '/model/jjsu/Model/'
 data_path = '/data/jjsu/easyedit/MMEdit/'
+result_path = '/data/jjsu/easyedit/MMEdit/results/'
+
+# python3 start_code.py --device 0 --sub_device 0 --method wise --model blip2 --ds caption
 
 def apply_mend_method(args):
     # 加载训练配置
@@ -36,6 +39,7 @@ def apply_mend_method(args):
         raise ValueError(f"Unknown model configuration: {args.model}")
     training_hparams.coco_image = data_path
     training_hparams.rephrase_image = data_path
+    training_hparams.results_dir = result_path
     # 设置设备
     training_hparams.device = "cuda:" + args.device
     training_hparams.sub_device = "cuda:" + args.sub_device
@@ -116,7 +120,7 @@ def apply_wise_method(args):
 
 
 def main():
-    # python3 start_code.py --device 7 --sub_device 7 --method mend --model blip2 --ds caption
+    # python3 start_code.py --device 4 --sub_device 4 --method mend --model blip2 --ds caption
     # 创建参数解析器
     parser = argparse.ArgumentParser(description='MEND Multimodal Training Script')
     

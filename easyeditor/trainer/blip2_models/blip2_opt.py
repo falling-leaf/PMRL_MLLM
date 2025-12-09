@@ -247,7 +247,7 @@ class Blip2OPT(Blip2Base):
             inputs_embeds = self.stack_with_padding(inputs_embeds, 0)
             attention_mask = self.stack_with_padding(attention_mask, 0)
             targets = self.stack_with_padding(targets)
-            print(inputs_embeds.shape, attention_mask.shape, targets.shape)
+            # print(inputs_embeds.shape, attention_mask.shape, targets.shape)
         else: 
             inputs_embeds, attention_mask, targets = self.image_encoding(samples)
         with self.maybe_autocast():
