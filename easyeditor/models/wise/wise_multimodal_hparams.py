@@ -20,6 +20,7 @@ class WISEMultimodalHyperParams(HyperParams):
     rephrase_image: str
 
     # Experiments
+    sequential_edit: bool
     edit_lr: float
     n_iter: int
     # Method

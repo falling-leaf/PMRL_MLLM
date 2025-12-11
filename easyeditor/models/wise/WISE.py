@@ -76,7 +76,20 @@ class WISE(torch.nn.Module):
         self.layer_name = self.layer.rsplit(".", 1)[-1]
         adapter_layer = getattr(self.edit_module, self.layer_name)
 
-        if type(adapter_layer) is not WISEAdapter:
+        # if the condition below is True, then it is single-edit
+        if not config.sequential_edit:
+        # if type(adapter_layer) is not WISEAdapter:
+            # 如果 adapter_layer 已经是 WISEAdapter，提取其原始层
+            if type(adapter_layer) is WISEAdapter:
+                # 使用 original_layer 作为基础层（这是保存的原始层副本）
+                base_layer = adapter_layer.original_layer
+            else:
+                base_layer = adapter_layer
+            
+            setattr(self.edit_module, self.layer_name, WISEAdapter(config, base_layer, transpose=transpose))
+            self.original_layer = copy.deepcopy(base_layer)
+            print(f"New weights successfully inserted into {layer}")
+        elif type(adapter_layer) is not WISEAdapter:
             setattr(self.edit_module, self.layer_name, WISEAdapter(config, adapter_layer, transpose=transpose))
             self.original_layer = copy.deepcopy(adapter_layer)
             print(f"New weights successfully inserted into {layer}")
@@ -571,8 +584,8 @@ class WISEMultimodal(WISE):
             act_loss = super()._cal_activation_loss(super().get_adapter_layer().original_layer_output, super().get_adapter_layer().new_weight_layer_output,
                                                     config=config, act_mask=act_mask, deact_mask=deact_mask)
             loss = ft_loss + act_loss.to(ft_loss.device)
-            if self.config.model_name == "blip2":
-                print(self.model.generate(multimodal_inputs[0]))
+            # if self.config.model_name == "blip2":
+            #     print(self.model.generate(multimodal_inputs[0]))
             # elif self.config.model_name == "minigpt4":
             #     print(self.model.predict_answers(multimodal_inputs))
 

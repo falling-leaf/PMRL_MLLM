@@ -16,8 +16,13 @@ model_path = '/model/jjsu/Model/'
 data_path = '/data/jjsu/easyedit/MMEdit/'
 result_path = '/data/jjsu/easyedit/MMEdit/results/'
 
-# python3 start_code.py --device 0 --sub_device 0 --method wise --model blip2 --ds caption
-
+# easyedit python3 start_code.py --device 1 --sub_device 1 --method mend --model qwen --ds caption
+# easyedit_1 python3 start_code.py --device 2 --sub_device 2 --method wise --model blip2 --ds caption
+# easyedit_2 python3 start_code.py --device 3 --sub_device 3 --method mend --model qwen --ds vqa
+# easyedit_3 python3 start_code.py --device 0 --sub_device 0 --method wise --model minigpt4 --ds caption
+# easyedit_4 python3 start_code.py --device 6 --sub_device 6 --method wise --model minigpt4 --ds vqa
+# easyedit_5 python3 start_code.py --device 7 --sub_device 7 --method wise --model qwen --ds caption
+# python3 start_code.py --device 7 --sub_device 7 --method mend --model llava --ds caption(显存问题)
 def apply_mend_method(args):
     # 加载训练配置
     if args.model == 'blip2':
@@ -28,6 +33,12 @@ def apply_mend_method(args):
         training_hparams.state_dict_file = model_path + 'eva_vit_g.pth'
     elif args.model == 'qwen':
         training_hparams = MENDMultimodalTrainingHparams.from_hparams('./hparams/TRAINING/MEND/qwen2vl-7b.yaml')
+        training_hparams.name = model_path + 'qwen2-vl-7b'
+        training_hparams.dtype = torch.bfloat16
+    elif args.model == 'llava':
+        training_hparams = MENDMultimodalTrainingHparams.from_hparams('./hparams/TRAINING/MEND/llavaov-7b.yaml')
+        training_hparams.name = model_path + 'llava-onevision-qwen2-7b-ov-hf'
+        training_hparams.dtype = torch.bfloat16
     elif args.model == 'minigpt4':
         training_hparams = MENDMultimodalTrainingHparams.from_hparams('./hparams/TRAINING/MEND/minigpt4.yaml')
         training_hparams.name = model_path + 'Vicuna'
@@ -80,10 +91,12 @@ def apply_wise_method(args):
     elif args.model == 'qwen':
         hparams = WISEMultimodalHyperParams.from_hparams('./hparams/WISE/qwen2vl-7b.yaml')
         hparams.model_name = model_path + "qwen2-vl-7b"
+        hparams.name = model_path + "qwen2-vl-7b"
         hparams.dtype = torch.bfloat16
     elif args.model == 'llava':
         hparams = WISEMultimodalHyperParams.from_hparams('./hparams/WISE/llavaov-7b.yaml')
         hparams.model_name = model_path + "llava-onevision-qwen2-7b-ov-hf"
+        hparams.name = model_path + "llava-onevision-qwen2-7b-ov-hf"
         hparams.dtype = torch.bfloat16
     else:
         raise ValueError(f"Unknown model configuration: {args.model}")

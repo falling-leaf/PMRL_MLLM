@@ -27,6 +27,7 @@ weights: 1.0
 retrieve: False
 replay: False
 
+sequential_edit: False
 model_parallel: False
 use_chat_template: True
 
