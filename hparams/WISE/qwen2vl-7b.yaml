@@ -1,6 +1,6 @@
 alg_name: "WISE"
 model_name: "./hugging_cache/qwen2-vl-7b"
-name: .
+name: ./hugging_cache/qwen2-vl-7b
 tokenizer_class: .
 tokenizer_name: .
 
@@ -9,7 +9,7 @@ device: 0
 mask_ratio: 0.2
 edit_lr: 1.0
 # n_iter: 70
-n_iter: 5
+n_iter: 10
 norm_constraint: 1.0
 act_margin: [5.0, 20.0, 10.0] # alpha, beta, gamma
 act_ratio: 0.4
@@ -32,6 +32,7 @@ weights: 1.0
 retrieve: True
 replay: False # True --> will replay the past editing instances: see https://arxiv.org/abs/2405.14768 Appendix B.3
 
+sequential_edit: False
 model_parallel: False
 use_chat_template: True
 

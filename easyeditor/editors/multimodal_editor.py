@@ -148,7 +148,7 @@ class MultimodalEditor:
             elif "qwen2-vl" in hparams.model_name.lower():
                 self.model = Qwen2VLForConditionalGeneration.from_pretrained(
                     hparams.model_name, 
-                    torch_dtype=torch.float32,
+                    torch_dtype=hparams.dtype,
                     # attn_implementation="flash_attention_2"
                 )
                 self.vis_tok = Qwen2VLProcessor()
