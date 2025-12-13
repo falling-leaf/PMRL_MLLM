@@ -18,7 +18,7 @@ result_path = '/data/jjsu/easyedit/MMEdit/results/'
 
 # easyedit python3 start_code.py --device 1 --sub_device 1 --method mend --model qwen --ds caption
 # easyedit_1 python3 start_code.py --device 2 --sub_device 2 --method wise --model blip2 --ds caption
-# easyedit_2 python3 start_code.py --device 3 --sub_device 3 --method mend --model qwen --ds vqa
+# easyedit_2 python3 start_code.py --device 3 --sub_device 6 --method mend --model qwen --ds caption
 # easyedit_3 python3 start_code.py --device 0 --sub_device 0 --method wise --model minigpt4 --ds caption
 # easyedit_4 python3 start_code.py --device 6 --sub_device 6 --method wise --model minigpt4 --ds vqa
 # easyedit_5 python3 start_code.py --device 7 --sub_device 7 --method wise --model qwen --ds caption

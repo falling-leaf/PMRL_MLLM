@@ -176,17 +176,6 @@ class MEND(EditableModel):
 
         if not str(self.config.device).startswith('cuda'):
             self.config.device = f'cuda:{self.config.device}'
-        
-        # 处理sub_device配置，支持双卡部署
-        if hasattr(self.config, 'sub_device') and self.config.sub_device is not None:
-            if isinstance(self.config.sub_device, str):
-                if not self.config.sub_device.startswith('cuda'):
-                    self.config.sub_device = f'cuda:{self.config.sub_device}'
-            elif isinstance(self.config.sub_device, int):
-                self.config.sub_device = f'cuda:{self.config.sub_device}'
-            LOG.info(f"Sub-device configured: {self.config.sub_device}")
-        else:
-            self.config.sub_device = None
 
         for n, p in model.named_parameters():
             if n not in self.config.inner_params:
