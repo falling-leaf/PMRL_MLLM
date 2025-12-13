@@ -3,7 +3,7 @@ model_name: "./hugging_cache/llava-onevision-qwen2-7b-ov-hf"
 name: ./hugging_cache/llava-onevision-qwen2-7b-ov-hf
 tokenizer_class: .
 tokenizer_name: .
-
+dtype: torch.bfloat16
 
 device: 0
 

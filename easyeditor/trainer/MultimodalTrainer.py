@@ -43,26 +43,6 @@ class MultimodalTrainer(BaseTrainer):
         self.model.train(training)
         self.original_model.train(training)
 
-        # 检查是否配置了sub_device用于双卡部署
-        use_sub_device = (hasattr(self.config, 'sub_device') and 
-                         self.config.sub_device is not None and 
-                         self.config.sub_device != self.config.device)
-        
-        if use_sub_device:
-            # 确保sub_device是字符串格式
-            if isinstance(self.config.sub_device, int):
-                sub_device_str = f'cuda:{self.config.sub_device}'
-            elif isinstance(self.config.sub_device, str):
-                if not self.config.sub_device.startswith('cuda'):
-                    sub_device_str = f'cuda:{self.config.sub_device}'
-                else:
-                    sub_device_str = self.config.sub_device
-            else:
-                sub_device_str = None
-                use_sub_device = False
-        else:
-            sub_device_str = None
-
         with torch.no_grad():
             base_outputs = self.model(batch["loc"])
             if not isinstance(base_outputs, torch.Tensor):
@@ -82,101 +62,46 @@ class MultimodalTrainer(BaseTrainer):
         edited_model, model_info = self.model.edit(batch["edit_inner"], batch["cond"])
         edit_time = time.time() - start
 
-        # 辅助函数：将batch移到指定设备
-        def move_batch_to_device(batch_dict, device):
-            """将batch字典中的所有tensor移到指定设备"""
-            if isinstance(batch_dict, dict):
-                return {k: move_batch_to_device(v, device) if isinstance(v, (dict, torch.Tensor)) else v 
-                       for k, v in batch_dict.items()}
-            elif isinstance(batch_dict, torch.Tensor):
-                return batch_dict.to(device)
-            else:
-                return batch_dict
-
         with torch.set_grad_enabled(training):
-            # 如果使用sub_device，将edited_model的前向传播移到sub_device
-            # 注意：edited_model是functional模型，我们需要将输入移到sub_device
-            if use_sub_device:
-                # 将edited_model相关的batch移到sub_device
-                edit_outer_batch = move_batch_to_device(batch["edit_outer"], sub_device_str)
-                post_edit_outputs = edited_model(edit_outer_batch)
-                # 提取logits并移回主设备
-                if not isinstance(post_edit_outputs, torch.Tensor):
-                    post_edit_logits = post_edit_outputs.logits.to(self.config.device)
-                    post_batch_labels = getattr(post_edit_outputs, 'labels', None)
-                    if post_batch_labels is None:
-                        post_batch_labels = batch["edit_outer"]["labels"]
-                    else:
-                        post_batch_labels = post_batch_labels.to(self.config.device) if isinstance(post_batch_labels, torch.Tensor) else post_batch_labels
-                else:
-                    post_edit_logits = post_edit_outputs.to(self.config.device)
+            # Editing loss
+            post_edit_outputs = edited_model(batch["edit_outer"])
+            if not isinstance(post_edit_outputs, torch.Tensor):
+                post_edit_logits = post_edit_outputs.logits
+                # 检查输出对象是否有 labels 属性，如果没有则从 batch 中获取
+                post_batch_labels = getattr(post_edit_outputs, 'labels', None)
+                if post_batch_labels is None:
                     post_batch_labels = batch["edit_outer"]["labels"]
             else:
-                post_edit_outputs = edited_model(batch["edit_outer"])
-                if not isinstance(post_edit_outputs, torch.Tensor):
-                    post_edit_logits = post_edit_outputs.logits
-                    # 检查输出对象是否有 labels 属性，如果没有则从 batch 中获取
-                    post_batch_labels = getattr(post_edit_outputs, 'labels', None)
-                    if post_batch_labels is None:
-                        post_batch_labels = batch["edit_outer"]["labels"]
-                else:
-                    post_edit_logits = post_edit_outputs
-                    post_batch_labels = batch["edit_outer"]["labels"]
+                post_edit_logits = post_edit_outputs
+                post_batch_labels = batch["edit_outer"]["labels"]
 
-            if use_sub_device:
-                edit_inner_batch = move_batch_to_device(batch["edit_inner"], sub_device_str)
-                inner_edit_outputs = edited_model(edit_inner_batch)
-                if not isinstance(inner_edit_outputs, torch.Tensor):
-                    inner_edit_logits = inner_edit_outputs.logits.to(self.config.device)
-                    inner_batch_labels = getattr(inner_edit_outputs, 'labels', None)
-                    if inner_batch_labels is None:
-                        inner_batch_labels = batch["edit_inner"]["labels"]
-                    else:
-                        inner_batch_labels = inner_batch_labels.to(self.config.device) if isinstance(inner_batch_labels, torch.Tensor) else inner_batch_labels
-                else:
-                    inner_edit_logits = inner_edit_outputs.to(self.config.device)
+            inner_edit_outputs = edited_model(batch["edit_inner"])
+            
+            if not isinstance(inner_edit_outputs, torch.Tensor):
+                inner_edit_logits = inner_edit_outputs.logits
+                # 检查输出对象是否有 labels 属性，如果没有则从 batch 中获取
+                inner_batch_labels = getattr(inner_edit_outputs, 'labels', None)
+                if inner_batch_labels is None:
                     inner_batch_labels = batch["edit_inner"]["labels"]
             else:
-                inner_edit_outputs = edited_model(batch["edit_inner"])
-                if not isinstance(inner_edit_outputs, torch.Tensor):
-                    inner_edit_logits = inner_edit_outputs.logits
-                    # 检查输出对象是否有 labels 属性，如果没有则从 batch 中获取
-                    inner_batch_labels = getattr(inner_edit_outputs, 'labels', None)
-                    if inner_batch_labels is None:
-                        inner_batch_labels = batch["edit_inner"]["labels"]
-                else:
-                    inner_edit_logits = inner_edit_outputs
-                    inner_batch_labels = batch["edit_inner"]["labels"]
+                inner_edit_logits = inner_edit_outputs
+                inner_batch_labels = batch["edit_inner"]["labels"]
 
             # rephrase image
             if self.train_set.__class__.__name__ == "ComprehendEditDataset":
                 post_image_edit_logits = inner_edit_logits
                 post_image_batch_labels = inner_batch_labels
             else:
-                if use_sub_device:
-                    edit_outer_image_batch = move_batch_to_device(batch["edit_outer_image"], sub_device_str)
-                    post_image_edit_outputs = edited_model(edit_outer_image_batch)
-                    if not isinstance(post_image_edit_outputs, torch.Tensor):
-                        post_image_edit_logits = post_image_edit_outputs.logits.to(self.config.device)
-                        post_image_batch_labels = getattr(post_image_edit_outputs, 'labels', None)
-                        if post_image_batch_labels is None:
-                            post_image_batch_labels = batch["edit_outer_image"]["labels"]
-                        else:
-                            post_image_batch_labels = post_image_batch_labels.to(self.config.device) if isinstance(post_image_batch_labels, torch.Tensor) else post_image_batch_labels
-                    else:
-                        post_image_edit_logits = post_image_edit_outputs.to(self.config.device)
+                post_image_edit_outputs = edited_model(batch["edit_outer_image"])
+                if not isinstance(post_image_edit_outputs, torch.Tensor):
+                    post_image_edit_logits = post_image_edit_outputs.logits
+                    # 检查输出对象是否有 labels 属性，如果没有则从 batch 中获取
+                    post_image_batch_labels = getattr(post_image_edit_outputs, 'labels', None)
+                    if post_image_batch_labels is None:
                         post_image_batch_labels = batch["edit_outer_image"]["labels"]
                 else:
-                    post_image_edit_outputs = edited_model(batch["edit_outer_image"])
-                    if not isinstance(post_image_edit_outputs, torch.Tensor):
-                        post_image_edit_logits = post_image_edit_outputs.logits
-                        # 检查输出对象是否有 labels 属性，如果没有则从 batch 中获取
-                        post_image_batch_labels = getattr(post_image_edit_outputs, 'labels', None)
-                        if post_image_batch_labels is None:
-                            post_image_batch_labels = batch["edit_outer_image"]["labels"]
-                    else:
-                        post_image_edit_logits = post_image_edit_outputs
-                        post_image_batch_labels = batch["edit_outer_image"]["labels"]
+                    post_image_edit_logits = post_image_edit_outputs
+                    post_image_batch_labels = batch["edit_outer_image"]["labels"]
             l_edit = self.model.edit_loss_fn(self.config, post_edit_logits, post_batch_labels, multimodal=True)["nll"]
             l_image_edit = self.model.edit_loss_fn(self.config, post_image_edit_logits, post_image_batch_labels, multimodal=True)["nll"]          
             
@@ -186,65 +111,19 @@ class MultimodalTrainer(BaseTrainer):
                 inner_edit_dict = self.model.edit_loss_fn(self.config, inner_edit_logits, inner_batch_labels, multimodal=True)
                 image_rephrase_edit_dict = self.model.edit_loss_fn(self.config, post_image_edit_logits, post_image_batch_labels, multimodal=True)
             
-            if use_sub_device:
-                loc_batch = move_batch_to_device(batch["loc"], sub_device_str)
-                post_base_outputs = edited_model(loc_batch)
-                if not isinstance(post_base_outputs, torch.Tensor):
-                    post_base_logits = post_base_outputs.logits.to(self.config.device)
-                    kl_mask = getattr(post_base_outputs, 'attention_mask', None)
+            post_base_outputs = edited_model(batch["loc"])
+            if not isinstance(post_base_outputs, torch.Tensor):
+                post_base_logits = post_base_outputs.logits
+                kl_mask = getattr(post_base_outputs, 'attention_mask', None)
+                if kl_mask is None:
+                    kl_mask = batch["loc"].get("attention_mask", None)
                     if kl_mask is None:
-                        kl_mask = batch["loc"].get("attention_mask", None)
-                        if kl_mask is None:
-                            kl_mask = torch.ones(post_base_logits.shape[0], post_base_logits.shape[1]).to(self.config.device)
-                        else:
-                            kl_mask = kl_mask.to(self.config.device) if isinstance(kl_mask, torch.Tensor) else kl_mask
-                    else:
-                        kl_mask = kl_mask.to(self.config.device) if isinstance(kl_mask, torch.Tensor) else kl_mask
-                else:
-                    post_base_logits = post_base_outputs.to(self.config.device)
-                    kl_mask = torch.ones(post_base_logits.shape[0], post_base_logits.shape[1]).to(self.config.device)
+                        kl_mask = torch.ones(post_base_logits.shape[0], post_base_logits.shape[1]).to(post_base_logits.device)
             else:
-                post_base_outputs = edited_model(batch["loc"])
-                if not isinstance(post_base_outputs, torch.Tensor):
-                    post_base_logits = post_base_outputs.logits
-                    kl_mask = getattr(post_base_outputs, 'attention_mask', None)
-                    if kl_mask is None:
-                        kl_mask = batch["loc"].get("attention_mask", None)
-                        if kl_mask is None:
-                            kl_mask = torch.ones(post_base_logits.shape[0], post_base_logits.shape[1]).to(post_base_logits.device)
-                else:
-                    post_base_logits = post_base_outputs
-                    kl_mask = torch.ones(post_base_logits.shape[0], post_base_logits.shape[1]).to(post_base_logits.device)
+                post_base_logits = post_base_outputs
+                kl_mask = torch.ones(post_base_logits.shape[0], post_base_logits.shape[1]).to(post_base_logits.device)
 
-            if use_sub_device:
-                loc_image_batch = move_batch_to_device(batch["loc_image"], sub_device_str)
-                post_image_base_outputs = edited_model(loc_image_batch)
-                if not isinstance(post_image_base_outputs, torch.Tensor):
-                    post_image_base_logits = post_image_base_outputs.logits.to(self.config.device)
-                    kl_image_mask = getattr(post_image_base_outputs, 'attention_mask', None)
-                    if kl_image_mask is None:
-                        kl_image_mask = batch["loc_image"].get("attention_mask", None)
-                        if kl_image_mask is None:
-                            kl_image_mask = torch.ones(post_image_base_logits.shape[0], post_image_base_logits.shape[1]).to(self.config.device)
-                        else:
-                            kl_image_mask = kl_image_mask.to(self.config.device) if isinstance(kl_image_mask, torch.Tensor) else kl_image_mask
-                    else:
-                        kl_image_mask = kl_image_mask.to(self.config.device) if isinstance(kl_image_mask, torch.Tensor) else kl_image_mask
-                else:
-                    post_image_base_logits = post_image_base_outputs.to(self.config.device)
-                    kl_image_mask = torch.ones(post_image_base_logits.shape[0], post_image_base_logits.shape[1]).to(self.config.device)
-            else:
-                post_image_base_outputs = edited_model(batch["loc_image"])
-                if not isinstance(post_image_base_outputs, torch.Tensor):
-                    post_image_base_logits = post_image_base_outputs.logits
-                    kl_image_mask = getattr(post_image_base_outputs, 'attention_mask', None)
-                    if kl_image_mask is None:
-                        kl_image_mask = batch["loc_image"].get("attention_mask", None)
-                        if kl_image_mask is None:
-                            kl_image_mask = torch.ones(post_image_base_logits.shape[0], post_image_base_logits.shape[1]).to(post_image_base_logits.device)
-                else:
-                    post_image_base_logits = post_image_base_outputs
-                    kl_image_mask = torch.ones(post_image_base_logits.shape[0], post_image_base_logits.shape[1]).to(post_image_base_logits.device)
+            post_image_base_outputs = edited_model(batch["loc_image"])
             if not isinstance(post_image_base_outputs, torch.Tensor):
                 post_image_base_logits = post_image_base_outputs.logits
                 kl_image_mask = getattr(post_image_base_outputs, 'attention_mask', None)
@@ -308,20 +187,7 @@ class MultimodalTrainer(BaseTrainer):
         info_dict["loss/total_edit"] = l_total_edit.item()
         info_dict["memory/alloc_max"] = torch.cuda.max_memory_allocated()
         info_dict["memory/res_max"] = torch.cuda.max_memory_reserved()
-        
-        # 如果使用sub_device，也记录sub_device的显存使用
-        if use_sub_device:
-            info_dict["memory/alloc_max_sub"] = torch.cuda.max_memory_allocated(device=sub_device_str)
-            info_dict["memory/res_max_sub"] = torch.cuda.max_memory_reserved(device=sub_device_str)
-        
         info_dict = {**info_dict, **model_info}
-        
-        # 清理显存：删除不需要的中间变量
-        if use_sub_device:
-            # 清理sub_device上的缓存
-            torch.cuda.empty_cache()
-            # 清理主设备上的缓存
-            torch.cuda.empty_cache()
 
         return l_total, l_edit, l_loc, l_base, info_dict
 

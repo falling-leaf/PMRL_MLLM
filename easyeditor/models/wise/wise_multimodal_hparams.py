@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import List, Union, Optional, Any
 from ...util.hparams import HyperParams
 import yaml
-
+import torch
 
 @dataclass
 class WISEMultimodalHyperParams(HyperParams):
@@ -47,6 +47,7 @@ class WISEMultimodalHyperParams(HyperParams):
     name: str
     tokenizer_class: str
     tokenizer_name: str
+    dtype: torch.dtype
 
     # Defaults
     batch_size: int = 1
@@ -71,6 +72,17 @@ class WISEMultimodalHyperParams(HyperParams):
         assert len(config['act_margin']) == 3
         config['alpha'], config['beta'], config['gamma'] = config['act_margin'][0], config['act_margin'][1], config['act_margin'][2]
         config.pop('act_margin')
+
+        if 'dtype' in config:
+            dtype_val = config['dtype']
+            if isinstance(dtype_val, str):
+                # 移除可能存在的 "torch." 前缀 (例如 YAML 里写了 "torch.bfloat16")
+                dtype_name = dtype_val.replace('torch.', '')
+                # 从 torch 模块获取对应的属性
+                if hasattr(torch, dtype_name):
+                    config['dtype'] = getattr(torch, dtype_name)
+                else:
+                    raise ValueError(f"Unsupported dtype: {dtype_val}")
 
         assert (config and config['alg_name'] == 'WISE'), \
             f'WISEHyperParams can not load from {hparams_name_or_path}. alg_name is {config["alg_name"]}'

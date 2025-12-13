@@ -74,8 +74,6 @@ class CaptionDataset(BaseDataset):
         if size is not None:
             self.annotation = self.annotation[:size]  
         for i, record in enumerate(self.annotation):
-            # if i == 50:
-            #     break
             if record['alt'] == "":
                 continue
             

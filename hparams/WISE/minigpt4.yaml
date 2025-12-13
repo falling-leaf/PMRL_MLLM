@@ -4,6 +4,7 @@ model_name: minigpt4
 tokenizer_class: LlamaTokenizer
 tokenizer_name: hugging_cache/Vicuna
 device: 0
+dtype: torch.float32
 
 mask_ratio: 0.2
 edit_lr: 1.0

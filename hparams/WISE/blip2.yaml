@@ -4,6 +4,7 @@ model_name: blip2
 tokenizer_class: GPT2Tokenizer
 tokenizer_name: hugging_cache/opt-2.7b
 device: 6
+dtype: torch.float32
 
 mask_ratio: 0.2
 edit_lr: 1.0
