@@ -148,6 +148,9 @@ def blip2_multimodal_tokenize(batch, processor, device, context_templates=None, 
     file_type = batch[0]['file_type']
     loc_prompts = [item['locality_prompt'] for item in batch]
     loc_prompts_labels = [item['locality_ground_truth'] for item in batch]
+    m_loc_prompt = [item["multimodal_locality_prompt"] for item in batch]
+    m_loc_ground_truth = [item["multimodal_locality_ground_truth"] for item in batch]
+    m_loc_image = [item["multimodal_locality_image"] for item in batch]
 
     # ------------------ 构建 edit_inner ------------------
     edit_inner = {}
@@ -176,6 +179,18 @@ def blip2_multimodal_tokenize(batch, processor, device, context_templates=None, 
 
     edit_loc['prompts_len'] = [len(tok.encode(s, add_special_tokens=False)) for s in loc_prompts]
     edit_loc['labels'] = tok(loc_prompts_labels, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
+
+    if hasattr(hparams, 'using_extra'):
+        similar_image = [item["image_similar"] for item in batch]
+        edit_similar = {}
+        edit_similar['image'] = torch.stack(similar_image, dim=0).to(device)
+
+        # text_input = prompt + target
+        edit_similar['text_input'] = [p + " " + l for p, l in zip(prompts, labels)]
+        edit_similar['labels_text'] = labels  # 先保留原始文本形式
+
+        edit_similar['prompts_len'] = [len(tok.encode(s, add_special_tokens=False)) for s in prompts]
+        edit_similar['labels'] = tok(labels, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
 
     # ------------------ locality act/deact masks ------------------
     encoding = tok(edit_inner['text_input'], return_tensors="pt", padding=True, truncation=True)
@@ -233,6 +248,8 @@ def blip2_multimodal_tokenize(batch, processor, device, context_templates=None, 
     # print(last_prompt_token_loc, last_ans_token_loc)
     ans_token_len = tokens["labels"].size(1) - last_prompt_token_loc - last_ans_token_loc
     multimodal_inputs = [edit_inner, edit_loc]
+    if hasattr(hparams, 'using_extra'):
+        multimodal_inputs.append(edit_inner)
     return multimodal_inputs, tokens, ans_token_len, act_masks, deact_masks
 
 
