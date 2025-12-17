@@ -110,6 +110,16 @@ class VQADataset(BaseDataset):
             item['multimodal_locality_prompt'] = record['m_loc_q']
             item['multimodal_locality_ground_truth'] = record['m_loc_a']
             item['file_type'] = "image"
+
+            if hasattr(config, 'using_extra'):
+                file_name = record["image_rephrase"].split('/')[-1]
+                if file_name and file_name[0].isdigit():
+                    if '_' in file_name:
+                        file_name = file_name.split('_', 1)[1]
+                similar_image_path = os.path.join(self.vis_root, "val2014_image_similar_0/" + file_name)
+                similar_image = self.vis_processor(similar_image_path, file_type="image")
+                item['image_similar'] = similar_image
+
             dirty_data = False
             for key, value in item.items():
                 if isinstance(value, str) and value == '':

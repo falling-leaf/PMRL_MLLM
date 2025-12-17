@@ -16,8 +16,8 @@ model_path = '/model/jjsu/Model/'
 data_path = '/data/jjsu/easyedit/MMEdit/'
 result_path = '/data/jjsu/easyedit/MMEdit/results/'
 
-# easyedit python3 start_code.py --device 1 --sub_device 1 --method mend --model qwen --ds caption
-# easyedit_1 python3 start_code.py --device 2 --sub_device 2 --method wise --model blip2 --ds caption
+# easyedit python3 start_code.py --device 7 --sub_device 7 --method wise --model blip2 --ds caption
+# easyedit_1 python3 start_code.py --device 6 --sub_device 6 --method vqa --model blip2 --ds caption
 # easyedit_2 python3 start_code.py --device 3 --sub_device 6 --method mend --model qwen --ds caption
 # easyedit_3 python3 start_code.py --device 0 --sub_device 0 --method wise --model minigpt4 --ds caption
 # easyedit_4 python3 start_code.py --device 6 --sub_device 6 --method wise --model minigpt4 --ds vqa
@@ -106,10 +106,12 @@ def apply_wise_method(args):
     hparams.device = int(args.device)
     hparams.sub_device = int(args.sub_device)
 
+    # hparams.using_extra = True
+
     if args.ds == 'caption':
-        train_ds = CaptionDataset(caption_train_path, config=hparams)
+        train_ds = CaptionDataset(caption_train_path, config=hparams, size=100)
     elif args.ds == 'vqa':
-        train_ds = VQADataset(vqa_train_path, config=hparams)
+        train_ds = VQADataset(vqa_train_path, config=hparams, size=100)
     else:
         raise ValueError(f"Unknown dataset type: {args.ds}")
     

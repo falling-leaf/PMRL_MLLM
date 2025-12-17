@@ -93,6 +93,11 @@ class WISE(torch.nn.Module):
             setattr(self.edit_module, self.layer_name, WISEAdapter(config, adapter_layer, transpose=transpose))
             self.original_layer = copy.deepcopy(adapter_layer)
             print(f"New weights successfully inserted into {layer}")
+
+        if hasattr(config, "using_extra"):
+            self.using_extra = True
+        else:
+            self.using_extra = False
         
         gc.collect()
         torch.cuda.empty_cache()
@@ -287,19 +292,24 @@ class WISE(torch.nn.Module):
         # print("Output dim:", self.get_adapter_layer().weight.shape[0])
         # print("original_layer_output_shape: ", original_layer_output.shape)
         # print("new_weight_layer_output: ", new_weight_layer_output.shape)
+        if self.using_extra:
+            current_total_samples = 3 
+            seq_len = original_layer_output.size(0) // current_total_samples 
+
+            # 2. 计算前两个样本需要的行数 (2 * 45 = 90)
+            target_samples = 2
+            keep_rows = target_samples * seq_len
+
+            # 3. 对 original_layer_output 进行切片，只取前90行
+            original_layer_output = original_layer_output[:keep_rows]
+
+            # 4. 【重要】new_weight_layer_output 也必须切片，否则计算 Loss 时维度不匹配
+            if 'new_weight_layer_output' in locals():
+                new_weight_layer_output = new_weight_layer_output[:keep_rows]
         if self.config.model_name == "blip2":
             original_layer_output = original_layer_output.reshape(2, -1, original_layer_output.size(-1))
             new_weight_layer_output = new_weight_layer_output.reshape(2, -1, new_weight_layer_output.size(-1))
-        # TODO: 此处逻辑并不理解：len_temp在原逻辑中计算的似乎是有关batch大小的内容
-        # 而在后续计算dist时，将len_temp作为划分output[0]的基准（该基准在llava, qwen中均表现为batch大小）
-        # 现在，llava和qwen对于output的取值分别为[batch, seq, dim], batch=2
-        # loc样本在这里用于计算out_scope_dist
-        # 并且由于act_mask本身不奏效，整个循环仅会执行一次（act_mask值为[None]）
         len_temp = original_layer_output.shape[0] / k - 1
-        # if len_temp == 0:
-        #     len_temp = 1
-        # print(len_temp)
-        # print(act_mask)
         for i,act_mk in enumerate(act_mask):
             if act_mk is not None:
                 in_scope_dist = euc(original_layer_output[int(i*len_temp):int((i+1)*len_temp), ...], new_weight_layer_output[int(i*len_temp):int((i+1)*len_temp), ...], config,
@@ -670,9 +680,67 @@ class WISEMultimodal(WISE):
             super().get_adapter_layer().merge_weight()
             print(f'Merge Weight of (New, Original) Matrix... with {self.config.merge_alg}')
 
+    def pmrl_loss(
+            self,
+            embeddings_list, 
+            tau_alignment=0.05, 
+            tau_regularization=0.1, 
+            lambda_reg=1.0
+        ):
+        """
+        修正后的 PMRL Loss。
+        参数:
+            embeddings_list (list[torch.Tensor]): 列表包含 k 个 Tensor。
+                                                每个 Tensor 形状应为 (N, D)。
+                                                其中 N 是样本数(或 Token 数), D 是特征维度。
+        """
+        # 1. 维度检查与堆叠
+        # 期望 Z 的形状: (Batch_Size, Dimension, Num_Modalities)
+        # 这里 Batch_Size 指的是参与对齐的实例数量（在你的场景下是 ans_token_len）
+        if not isinstance(embeddings_list, list):
+            raise ValueError("pmrl_loss expects a list of tensors.")
+            
+        Z = torch.stack(embeddings_list, dim=2) 
+        
+        # 2. 模态内标准化 (Normalization) -> ||z^m|| = 1
+        Z = F.normalize(Z, p=2, dim=1)
+        
+        # 3. SVD
+        try:
+            # U: (N, D, K), S: (N, K), Vh: (N, K, K)
+            # 这里的 K (Num_Modalities) 在你的场景下是 2 (对应 batch 中的两个样本)
+            U, S, Vh = torch.linalg.svd(Z, full_matrices=False)
+        except RuntimeError:
+            return torch.tensor(0.0, device=Z.device, requires_grad=True)
+
+        batch_size = Z.shape[0] # 这里实际上是 Sequence Length (Answer Token Count)
+        device = Z.device
+
+        # --- Alignment Loss (Eq. 5) ---
+        # 最大化最大奇异值 sigma_1
+        alignment_targets = torch.zeros(batch_size, dtype=torch.long, device=device)
+        loss_alignment = F.cross_entropy(S / tau_alignment, alignment_targets)
+
+        # --- Regularization Loss (Eq. 6) ---
+        # 对比学习：增强不同 Token (实例) 之间的区分度
+        # U[:, :, 0] 取最大奇异值对应的特征方向
+        u1 = U[:, :, 0] # (N, D)
+        
+        # 计算 Token 间的相似度矩阵 (N, N)
+        logits_reg = torch.matmul(u1, u1.T) / tau_regularization
+        
+        # 目标是使得对角线最大（自身与自身相似）
+        reg_targets = torch.arange(batch_size, dtype=torch.long, device=device)
+        loss_regularization = F.cross_entropy(logits_reg, reg_targets)
+
+        # 4. 总损失
+        total_loss = loss_alignment + lambda_reg * loss_regularization
+        print(f"loss_alignment: {loss_alignment}, loss_regularization: {loss_regularization}")
+        
+        return total_loss
+
+
     def _cal_ft_loss(self, multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len):
-        # TODO: 前后矛盾，传入的是两个样本，但是处理时k强制为1，后续也将loc这个样本的训练直接用k割掉了
-        # 因此，这里的blip2和minigpt4传入的是一个样本（即acc）
         if hasattr(self.model.config, 'batch_size'):
             k = self.config.batch_size
         else:
@@ -680,33 +748,60 @@ class WISEMultimodal(WISE):
         
         if k != 1:
             raise AssertionError("Not support Batch Edit")
+
+        if self.using_extra:
+            k += 1
         
+        pmrl_loss = torch.tensor(0.0, device=self.device if hasattr(self, 'device') else multimodal_inputs['input_ids'].device)
+
         if self.config.model_name == "blip2" or self.config.model_name == "minigpt4":
-            logits = self.model(multimodal_inputs).logits
+            outputs = self.model(multimodal_inputs)
+            logits = outputs.logits
             labels = text_tokens["labels"]
             shift_labels = labels[:, 1:].contiguous()
             shift_logits = logits[:-k, :-1, :].contiguous()
             bs = text_tokens["labels"].shape[0]
         else: 
-            logits = self.model(**multimodal_inputs).logits
+            outputs = self.model(**multimodal_inputs)
+            logits = outputs.logits
             # 这里事实上是将acc和loc放在了两个batch上，然后来跑
             shift_labels = multimodal_inputs['input_ids'][:-k, 1:].contiguous()
             shift_logits = logits[:-k, :-1, :].contiguous()
             bs = text_tokens["input_ids"].shape[0] - k
+
+        if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+            hidden_states = outputs.hidden_states[-1]
+            print(f"hidden_states shape: {hidden_states.shape}")
+        else:
+            # 兜底：如果没有 hidden_states，被迫使用 logits (效果较差，但保证运行)
+            hidden_states = logits
+        if hidden_states.shape[0] >= 3:
+            # View 1: 第 0 个样本的 Answer 特征 (Ans_Len, Hidden_Dim)
+            # view_1 = hidden_states[0, -ans_token_len:, :]
+            # # View 2: 第 2 个样本的 Answer 特征 (Ans_Len, Hidden_Dim)
+            # view_2 = hidden_states[2, -ans_token_len:, :]
+            
+            base_features = hidden_states[0, -ans_token_len:, :]
+            view_1 = F.dropout(base_features, p=0.1, training=True)
+            view_2 = F.dropout(base_features, p=0.1, training=True).detach()
+            
+            # 计算 PMRL Loss
+            pmrl_loss = self.pmrl_loss([view_1, view_2], tau_alignment=1) * 0.5
+            print(f"pmrl_loss: {pmrl_loss}")
+        else:
+            # 如果 batch 数量不够 (例如只有 1 个样本)，跳过 PMRL
+            pass
+
+        print(f"pmrl_loss: {pmrl_loss.item()}")
+
+
         # only cal loss of target text tokens
         loss_fct = CrossEntropyLoss(reduction='none')
         a = shift_logits.view(-1, shift_logits.size(-1))
         b = shift_labels.view(-1)[-ans_token_len:]
-        # print("logits shape: ", logits.shape)
-        # print("shift_label shape:", shift_labels.shape)
-        # print("shift_logits shape:", shift_logits.shape)
-        # print("bs ", bs)
-        # print("a shape:", a.shape)
-        # print("b shape:", b.shape)
         a = a[-b.size(0):,:]
-        # print("a modified shape: ", a.shape)
         loss = loss_fct(a, b)
         loss = loss.view(bs, -1)
         label_mask = torch.ones_like(loss, dtype=torch.bool)        
         ft_loss = ((loss * label_mask).sum(1) / label_mask.sum(1)).mean()
-        return ft_loss
+        return ft_loss + pmrl_loss

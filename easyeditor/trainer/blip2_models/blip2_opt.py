@@ -23,6 +23,7 @@ class BLIP2Output(ModelOutput):
     logits: torch.FloatTensor = None
     labels: torch.IntTensor = None
     attention_mask: torch.IntTensor = None
+    hidden_states: torch.FloatTensor = None
 
 
 class Blip2OPT(Blip2Base):
@@ -256,6 +257,7 @@ class Blip2OPT(Blip2Base):
                 attention_mask=attention_mask,
                 return_dict=True,
                 labels=targets,
+                output_hidden_states=True
             )
         loss = outputs.loss
 
@@ -266,7 +268,8 @@ class Blip2OPT(Blip2Base):
             loss=loss,
             logits=outputs.logits,
             labels=targets,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            hidden_states=outputs.hidden_states
         )
     
     @torch.no_grad()
