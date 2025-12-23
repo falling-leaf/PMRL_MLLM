@@ -117,7 +117,7 @@ class VQADataset(BaseDataset):
                     if '_' in file_name:
                         file_name = file_name.split('_', 1)[1]
                 similar_image_path = os.path.join(self.vis_root, "val2014_image_similar_0/" + file_name)
-                similar_image = self.vis_processor(similar_image_path, file_type="image")
+                similar_image = self.vis_processor(rephrase_image_path, file_type="image") 
                 item['image_similar'] = similar_image
 
             dirty_data = False

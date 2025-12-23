@@ -106,7 +106,11 @@ def apply_wise_method(args):
     hparams.device = int(args.device)
     hparams.sub_device = int(args.sub_device)
 
-    # hparams.using_extra = True
+    hparams.using_extra = True
+    hparams.using_dropout = False
+    hparams.using_LAP = True
+    hparams.pmrl_tau = 1
+    hparams.pmrl_scale = 0.05
 
     if args.ds == 'caption':
         train_ds = CaptionDataset(caption_train_path, config=hparams, size=100)
