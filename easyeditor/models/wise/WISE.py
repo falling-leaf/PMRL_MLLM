@@ -93,11 +93,6 @@ class WISE(torch.nn.Module):
             setattr(self.edit_module, self.layer_name, WISEAdapter(config, adapter_layer, transpose=transpose))
             self.original_layer = copy.deepcopy(adapter_layer)
             print(f"New weights successfully inserted into {layer}")
-
-        if hasattr(config, "using_extra"):
-            self.using_extra = True
-        else:
-            self.using_extra = False
         
         gc.collect()
         torch.cuda.empty_cache()
@@ -292,20 +287,20 @@ class WISE(torch.nn.Module):
         # print("Output dim:", self.get_adapter_layer().weight.shape[0])
         # print("original_layer_output_shape: ", original_layer_output.shape)
         # print("new_weight_layer_output: ", new_weight_layer_output.shape)
-        if self.using_extra:
-            current_total_samples = 3 
-            seq_len = original_layer_output.size(0) // current_total_samples 
+        # if self.config.using_extra:
+        #     current_total_samples = 3 
+        #     seq_len = original_layer_output.size(0) // current_total_samples 
 
-            # 2. 计算前两个样本需要的行数 (2 * 45 = 90)
-            target_samples = 2
-            keep_rows = target_samples * seq_len
+        #     # 2. 计算前两个样本需要的行数 (2 * 45 = 90)
+        #     target_samples = 2
+        #     keep_rows = target_samples * seq_len
 
-            # 3. 对 original_layer_output 进行切片，只取前90行
-            original_layer_output = original_layer_output[:keep_rows]
+        #     # 3. 对 original_layer_output 进行切片，只取前90行
+        #     original_layer_output = original_layer_output[:keep_rows]
 
-            # 4. 【重要】new_weight_layer_output 也必须切片，否则计算 Loss 时维度不匹配
-            if 'new_weight_layer_output' in locals():
-                new_weight_layer_output = new_weight_layer_output[:keep_rows]
+        #     # 4. 【重要】new_weight_layer_output 也必须切片，否则计算 Loss 时维度不匹配
+        #     if 'new_weight_layer_output' in locals():
+        #         new_weight_layer_output = new_weight_layer_output[:keep_rows]
         if self.config.model_name == "blip2":
             original_layer_output = original_layer_output.reshape(2, -1, original_layer_output.size(-1))
             new_weight_layer_output = new_weight_layer_output.reshape(2, -1, new_weight_layer_output.size(-1))
@@ -748,9 +743,6 @@ class WISEMultimodal(WISE):
         
         if k != 1:
             raise AssertionError("Not support Batch Edit")
-
-        if self.using_extra:
-            k += 1
         
         pmrl_loss = torch.tensor(0.0, device=self.device if hasattr(self, 'device') else multimodal_inputs['input_ids'].device)
 
@@ -770,24 +762,68 @@ class WISEMultimodal(WISE):
             bs = text_tokens["input_ids"].shape[0] - k
 
         if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
-            hidden_states = outputs.hidden_states[-1]
-            print(f"hidden_states shape: {hidden_states.shape}")
+            # print("output hidden_state shape: ", len(outputs.hidden_states))
+            self.hidden_states = outputs.hidden_states[-2]
+            # print(f"hidden_states shape: {self.hidden_states.shape}")
         else:
-            # 兜底：如果没有 hidden_states，被迫使用 logits (效果较差，但保证运行)
-            hidden_states = logits
-        if hidden_states.shape[0] >= 3:
-            # View 1: 第 0 个样本的 Answer 特征 (Ans_Len, Hidden_Dim)
-            # view_1 = hidden_states[0, -ans_token_len:, :]
-            # # View 2: 第 2 个样本的 Answer 特征 (Ans_Len, Hidden_Dim)
-            # view_2 = hidden_states[2, -ans_token_len:, :]
-            
-            base_features = hidden_states[0, -ans_token_len:, :]
-            view_1 = F.dropout(base_features, p=0.1, training=True)
-            view_2 = F.dropout(base_features, p=0.1, training=True).detach()
-            
+            self.hidden_states = logits
+        if self.config.using_extra:
+            base_features = self.hidden_states[0, :-ans_token_len, :]
+            rephrase_samples = []
+            if self.config.using_dropout:
+                rephrase_samples.append(F.dropout(base_features, p=0.1, training=True))
+                rephrase_samples.append(F.dropout(base_features, p=0.1, training=True).detach())
+                rephrase_samples.append(F.dropout(base_features, p=0.1, training=True).detach())
+            elif self.config.using_LAP:
+                # --- 1. 获取基础特征（保持在计算图中） ---
+
+                # --- 2. 独立计算 delta（不使用显式 lm_head） ---
+                # 找到 answer 对应的 logits 部分
+                
+                a = shift_logits.view(-1, shift_logits.size(-1))
+                b = shift_labels.view(-1)[-ans_token_len:]
+                a = a[-b.size(0):,:]
+                # 计算用于探测方向的临时 Loss
+                # 注意：这个 Loss 必须是在计算图上的
+                loss_fct_inner = torch.nn.CrossEntropyLoss(reduction='sum')
+                J_LM = loss_fct_inner(a, b)
+
+                # 核心：直接对中间变量 self.hidden_states 求导
+                # retain_graph=True 是必须的，因为后面真正的 ft_loss 还需要用到这个计算图
+                grad_full = torch.autograd.grad(
+                    outputs=J_LM,
+                    inputs=self.hidden_states,
+                    retain_graph=True,
+                    only_inputs=True,
+                    allow_unused=True
+                )[0]
+
+                if grad_full is not None:
+                    # 截取对应 answer token 位置的梯度
+                    # grad_base = grad_full[0, -ans_token_len:, :]
+                    grad_base = grad_full[0, :-ans_token_len, :]
+                    
+                    # 构造 delta 数值（剥离计算图）
+                    epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
+                    # 使用 .data 确保 delta 是纯数值，不带梯度
+                    delta = (grad_base.data / (torch.norm(grad_base.data) + 1e-8)) * epsilon
+                    # print(delta)
+                else:
+                    delta = torch.zeros_like(base_features.data)
+
+                # --- 3. 构造 PMRL 视图 ---
+                # 锚点视图：关联计算图，用于传导 pmrl_loss 的梯度回到模型
+                view_anchor = base_features 
+                
+                # 对抗视图：锚点数值 + 偏移量，并完全 detach
+                # 它作为 PMRL 的“静态目标”
+                view_adversarial = (base_features.data + delta).detach()
+
+                rephrase_samples = [view_anchor, view_adversarial]
+            else:
+                raise ValueError("unknown method")
             # 计算 PMRL Loss
-            pmrl_loss = self.pmrl_loss([view_1, view_2], tau_alignment=1) * 0.5
-            print(f"pmrl_loss: {pmrl_loss}")
+            pmrl_loss = self.pmrl_loss(rephrase_samples, tau_alignment=self.config.pmrl_tau) * self.config.pmrl_scale
         else:
             # 如果 batch 数量不够 (例如只有 1 个样本)，跳过 PMRL
             pass

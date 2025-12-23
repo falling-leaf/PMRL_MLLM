@@ -248,8 +248,8 @@ def blip2_multimodal_tokenize(batch, processor, device, context_templates=None, 
     # print(last_prompt_token_loc, last_ans_token_loc)
     ans_token_len = tokens["labels"].size(1) - last_prompt_token_loc - last_ans_token_loc
     multimodal_inputs = [edit_inner, edit_loc]
-    if hasattr(hparams, 'using_extra'):
-        multimodal_inputs.append(edit_inner)
+    # if hasattr(hparams, 'using_extra'):
+    #     multimodal_inputs.append(edit_inner)
     return multimodal_inputs, tokens, ans_token_len, act_masks, deact_masks
 
 
