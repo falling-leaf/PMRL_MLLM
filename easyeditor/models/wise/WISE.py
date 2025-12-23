@@ -682,70 +682,58 @@ class WISEMultimodal(WISE):
             tau_regularization=0.1, 
             lambda_reg=1.0
         ):
-        """
-        修正后的 PMRL Loss。
-        参数:
-            embeddings_list (list[torch.Tensor]): 列表包含 k 个 Tensor。
-                                                每个 Tensor 形状应为 (N, D)。
-                                                其中 N 是样本数(或 Token 数), D 是特征维度。
-        """
-        # 1. 维度检查与堆叠
-        # 期望 Z 的形状: (Batch_Size, Dimension, Num_Modalities)
-        # 这里 Batch_Size 指的是参与对齐的实例数量（在你的场景下是 ans_token_len）
         if not isinstance(embeddings_list, list):
             raise ValueError("pmrl_loss expects a list of tensors.")
             
+        # 1. 堆叠
         Z = torch.stack(embeddings_list, dim=2) 
         
-        # 2. 模态内标准化 (Normalization) -> ||z^m|| = 1
-        Z = F.normalize(Z, p=2, dim=1)
+        # =======================================================
+        # 【关键修复】: 强制转换为 float32 以避免 SVD 崩溃
+        # =======================================================
+        original_dtype = Z.dtype
+        Z = Z.to(torch.float32)
+
+        # 2. 模态内标准化 (Normalization)
+        # 增加 eps 防止除以零 (虽然 F.normalize 默认有 eps，但手动指定更稳)
+        Z = F.normalize(Z, p=2, dim=1, eps=1e-6)
         
         # 3. SVD
+        # 此时 Z 是 float32，SVD 会非常稳定
         try:
-            # U: (N, D, K), S: (N, K), Vh: (N, K, K)
-            # 这里的 K (Num_Modalities) 在你的场景下是 2 (对应 batch 中的两个样本)
             U, S, Vh = torch.linalg.svd(Z, full_matrices=False)
-        except RuntimeError:
+        except RuntimeError as e:
+            # 即使在 float32 下，如果输入全是 NaN 也会挂，这里做个兜底
+            print(f"SVD failed with error: {e}")
+            # 打印一下 Z 的统计信息帮助 debug
+            print(f"Z stats - Max: {Z.max()}, Min: {Z.min()}, IsNaN: {torch.isnan(Z).any()}")
             return torch.tensor(0.0, device=Z.device, requires_grad=True)
 
-        batch_size = Z.shape[0] # 这里实际上是 Sequence Length (Answer Token Count)
+        batch_size = Z.shape[0] 
         device = Z.device
 
-        # --- Alignment Loss (Eq. 5) ---
-        # 最大化最大奇异值 sigma_1
+        # --- Alignment Loss ---
         alignment_targets = torch.zeros(batch_size, dtype=torch.long, device=device)
         loss_alignment = F.cross_entropy(S / tau_alignment, alignment_targets)
 
-        # --- Regularization Loss (Eq. 6) ---
-        # 对比学习：增强不同 Token (实例) 之间的区分度
-        # U[:, :, 0] 取最大奇异值对应的特征方向
+        # --- Regularization Loss ---
         u1 = U[:, :, 0] # (N, D)
         
-        # 计算 Token 间的相似度矩阵 (N, N)
+        # 矩阵乘法也在 float32 下进行，精度更高
         logits_reg = torch.matmul(u1, u1.T) / tau_regularization
         
-        # 目标是使得对角线最大（自身与自身相似）
         reg_targets = torch.arange(batch_size, dtype=torch.long, device=device)
         loss_regularization = F.cross_entropy(logits_reg, reg_targets)
 
         # 4. 总损失
+        print("loss_alignment: {}, loss_regularization: {}".format(loss_alignment, loss_regularization))
         total_loss = loss_alignment + lambda_reg * loss_regularization
-        print(f"loss_alignment: {loss_alignment}, loss_regularization: {loss_regularization}")
         
+        # 如果外部需要 float16 的 loss (通常不需要，因为 scalar loss 会自动适配)，可以 cast 回去
+        # 但通常建议保持 float32 直到 backward
         return total_loss
 
-
-    def _cal_ft_loss(self, multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len):
-        if hasattr(self.model.config, 'batch_size'):
-            k = self.config.batch_size
-        else:
-            k = 1
-        
-        if k != 1:
-            raise AssertionError("Not support Batch Edit")
-        
-        pmrl_loss = torch.tensor(0.0, device=self.device if hasattr(self, 'device') else multimodal_inputs['input_ids'].device)
-
+    def mllm_forward(self, multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k):
         if self.config.model_name == "blip2" or self.config.model_name == "minigpt4":
             outputs = self.model(multimodal_inputs)
             logits = outputs.logits
@@ -760,73 +748,51 @@ class WISEMultimodal(WISE):
             shift_labels = multimodal_inputs['input_ids'][:-k, 1:].contiguous()
             shift_logits = logits[:-k, :-1, :].contiguous()
             bs = text_tokens["input_ids"].shape[0] - k
+        return outputs, logits, labels, shift_labels, shift_logits, bs
 
-        if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
-            # print("output hidden_state shape: ", len(outputs.hidden_states))
-            self.hidden_states = outputs.hidden_states[-2]
-            # print(f"hidden_states shape: {self.hidden_states.shape}")
+
+    def _cal_ft_loss(self, multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len):
+        if hasattr(self.model.config, 'batch_size'):
+            k = self.config.batch_size
         else:
-            self.hidden_states = logits
+            k = 1
+        
+        if k != 1:
+            raise AssertionError("Not support Batch Edit")
+        
+        pmrl_loss = torch.tensor(0.0, device=self.device if hasattr(self, 'device') else multimodal_inputs['input_ids'].device)
+
         if self.config.using_extra:
-            base_features = self.hidden_states[0, :-ans_token_len, :]
+            # blip2中，前32个token是image embedding
+            # base_features = self.hidden_states[0, :-ans_token_len, :]
             rephrase_samples = []
             if self.config.using_dropout:
-                rephrase_samples.append(F.dropout(base_features, p=0.1, training=True))
-                rephrase_samples.append(F.dropout(base_features, p=0.1, training=True).detach())
-                rephrase_samples.append(F.dropout(base_features, p=0.1, training=True).detach())
-            elif self.config.using_LAP:
-                # --- 1. 获取基础特征（保持在计算图中） ---
-
-                # --- 2. 独立计算 delta（不使用显式 lm_head） ---
-                # 找到 answer 对应的 logits 部分
-                
-                a = shift_logits.view(-1, shift_logits.size(-1))
-                b = shift_labels.view(-1)[-ans_token_len:]
-                a = a[-b.size(0):,:]
-                # 计算用于探测方向的临时 Loss
-                # 注意：这个 Loss 必须是在计算图上的
-                loss_fct_inner = torch.nn.CrossEntropyLoss(reduction='sum')
-                J_LM = loss_fct_inner(a, b)
-
-                # 核心：直接对中间变量 self.hidden_states 求导
-                # retain_graph=True 是必须的，因为后面真正的 ft_loss 还需要用到这个计算图
-                grad_full = torch.autograd.grad(
-                    outputs=J_LM,
-                    inputs=self.hidden_states,
-                    retain_graph=True,
-                    only_inputs=True,
-                    allow_unused=True
-                )[0]
-
-                if grad_full is not None:
-                    # 截取对应 answer token 位置的梯度
-                    # grad_base = grad_full[0, -ans_token_len:, :]
-                    grad_base = grad_full[0, :-ans_token_len, :]
+                inputs_embeds, attention_mask, targets = self.model.image_encoding(multimodal_inputs[0])
+                img_part = inputs_embeds[:, :32, :] 
+                txt_part = inputs_embeds[:, 32:, :]
+                sample_nums = 1
+                noisy_img_sample = []
+                for _ in range(sample_nums):
+                    # 关键修改：每次循环都要产生新的随机掩码
+                    noisy_img_part = F.dropout(img_part, p=0.1, training=True)
+                    perturbed_inputs_embeds = torch.cat([noisy_img_part, txt_part], dim=1)
                     
-                    # 构造 delta 数值（剥离计算图）
-                    epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
-                    # 使用 .data 确保 delta 是纯数值，不带梯度
-                    delta = (grad_base.data / (torch.norm(grad_base.data) + 1e-8)) * epsilon
-                    # print(delta)
-                else:
-                    delta = torch.zeros_like(base_features.data)
-
-                # --- 3. 构造 PMRL 视图 ---
-                # 锚点视图：关联计算图，用于传导 pmrl_loss 的梯度回到模型
-                view_anchor = base_features 
-                
-                # 对抗视图：锚点数值 + 偏移量，并完全 detach
-                # 它作为 PMRL 的“静态目标”
-                view_adversarial = (base_features.data + delta).detach()
-
-                rephrase_samples = [view_anchor, view_adversarial]
-            else:
-                raise ValueError("unknown method")
-            # 计算 PMRL Loss
-            pmrl_loss = self.pmrl_loss(rephrase_samples, tau_alignment=self.config.pmrl_tau) * self.config.pmrl_scale
+                    # 前向传播干扰样本
+                    self.model.LLM_forward(perturbed_inputs_embeds, attention_mask, targets)
+                    
+                    # 关键修改：在循环内获取并保存当前的输出
+                    # 注意：干扰样本通常不需要 detach，因为我们要优化模型使其在这个扰动下依然靠近 anchor
+                    current_perturbed_output = super().get_adapter_layer().new_weight_layer_output
+                    rephrase_samples.append(current_perturbed_output)
+                outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
+                base_output = super().get_adapter_layer().new_weight_layer_output
+                base_output = base_output.reshape(2, -1, base_output.size(-1))[0].detach()
+                rephrase_samples.append(base_output)
+                # print("base_output shape: ", base_output)
+                # print("perturbed_output shape: ", perturbed_output)
+                pmrl_loss = self.pmrl_loss(rephrase_samples, tau_alignment=self.config.pmrl_tau_alignment, tau_regularization=self.config.pmrl_tau_regularization) * self.config.pmrl_scale
         else:
-            # 如果 batch 数量不够 (例如只有 1 个样本)，跳过 PMRL
-            pass
+            outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
 
         print(f"pmrl_loss: {pmrl_loss.item()}")
 
@@ -841,3 +807,53 @@ class WISEMultimodal(WISE):
         label_mask = torch.ones_like(loss, dtype=torch.bool)        
         ft_loss = ((loss * label_mask).sum(1) / label_mask.sum(1)).mean()
         return ft_loss + pmrl_loss
+
+            # elif self.config.using_LAP:
+            #     # --- 1. 获取基础特征（保持在计算图中） ---
+
+            #     # --- 2. 独立计算 delta（不使用显式 lm_head） ---
+            #     # 找到 answer 对应的 logits 部分
+                
+            #     a = shift_logits.view(-1, shift_logits.size(-1))
+            #     b = shift_labels.view(-1)[-ans_token_len:]
+            #     a = a[-b.size(0):,:]
+            #     # 计算用于探测方向的临时 Loss
+            #     # 注意：这个 Loss 必须是在计算图上的
+            #     loss_fct_inner = torch.nn.CrossEntropyLoss(reduction='sum')
+            #     J_LM = loss_fct_inner(a, b)
+
+            #     # 核心：直接对中间变量 self.hidden_states 求导
+            #     # retain_graph=True 是必须的，因为后面真正的 ft_loss 还需要用到这个计算图
+            #     grad_full = torch.autograd.grad(
+            #         outputs=J_LM,
+            #         inputs=self.hidden_states,
+            #         retain_graph=True,
+            #         only_inputs=True,
+            #         allow_unused=True
+            #     )[0]
+
+            #     if grad_full is not None:
+            #         # 截取对应 answer token 位置的梯度
+            #         # grad_base = grad_full[0, -ans_token_len:, :]
+            #         grad_base = grad_full[0, :-ans_token_len, :]
+                    
+            #         # 构造 delta 数值（剥离计算图）
+            #         epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
+            #         # 使用 .data 确保 delta 是纯数值，不带梯度
+            #         delta = (grad_base.data / (torch.norm(grad_base.data) + 1e-8)) * epsilon
+            #         # print(delta)
+            #     else:
+            #         delta = torch.zeros_like(base_features.data)
+
+            #     # --- 3. 构造 PMRL 视图 ---
+            #     # 锚点视图：关联计算图，用于传导 pmrl_loss 的梯度回到模型
+            #     view_anchor = base_features 
+                
+            #     # 对抗视图：锚点数值 + 偏移量，并完全 detach
+            #     # 它作为 PMRL 的“静态目标”
+            #     view_adversarial = (base_features.data + delta).detach()
+
+            #     rephrase_samples = [view_anchor, view_adversarial]
+            # else:
+            #     raise ValueError("unknown method")
+            # 计算 PMRL Loss
