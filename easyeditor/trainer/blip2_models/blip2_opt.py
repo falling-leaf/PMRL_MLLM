@@ -236,6 +236,27 @@ class Blip2OPT(Blip2Base):
         # 堆叠成 [n, max_x, a]
         return torch.stack(padded, dim=0)
 
+    def LLM_forward(self, inputs_embeds, attention_mask, targets, using_dropout=False):
+        if using_dropout:
+            was_training = self.opt_model.training
+            self.opt_model.train(using_dropout)
+            
+        with self.maybe_autocast():
+            outputs = self.opt_model(
+                inputs_embeds=inputs_embeds, # inputs_embeds is the fusion of the image embeddings and the caption embeddings
+                attention_mask=attention_mask,
+                return_dict=True,
+                labels=targets,
+                output_hidden_states=True
+            )
+        if using_dropout:
+            self.opt_model.train(was_training)
+        loss = outputs.loss
+
+        if torch.isnan(outputs.logits).any():
+            print("NAN in logits!!!")
+        return outputs, loss
+
 
     def forward(self, samples):
         if isinstance(samples, list):
@@ -251,18 +272,7 @@ class Blip2OPT(Blip2Base):
             # print(inputs_embeds.shape, attention_mask.shape, targets.shape)
         else: 
             inputs_embeds, attention_mask, targets = self.image_encoding(samples)
-        with self.maybe_autocast():
-            outputs = self.opt_model(
-                inputs_embeds=inputs_embeds, # inputs_embeds is the fusion of the image embeddings and the caption embeddings
-                attention_mask=attention_mask,
-                return_dict=True,
-                labels=targets,
-                output_hidden_states=True
-            )
-        loss = outputs.loss
-
-        if torch.isnan(outputs.logits).any():
-            print("NAN in logits!!!")
+        outputs, loss = self.LLM_forward(inputs_embeds, attention_mask, targets)
 
         return BLIP2Output(
             loss=loss,
