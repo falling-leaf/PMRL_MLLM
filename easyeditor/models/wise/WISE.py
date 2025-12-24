@@ -287,20 +287,6 @@ class WISE(torch.nn.Module):
         # print("Output dim:", self.get_adapter_layer().weight.shape[0])
         # print("original_layer_output_shape: ", original_layer_output.shape)
         # print("new_weight_layer_output: ", new_weight_layer_output.shape)
-        # if self.config.using_extra:
-        #     current_total_samples = 3 
-        #     seq_len = original_layer_output.size(0) // current_total_samples 
-
-        #     # 2. 计算前两个样本需要的行数 (2 * 45 = 90)
-        #     target_samples = 2
-        #     keep_rows = target_samples * seq_len
-
-        #     # 3. 对 original_layer_output 进行切片，只取前90行
-        #     original_layer_output = original_layer_output[:keep_rows]
-
-        #     # 4. 【重要】new_weight_layer_output 也必须切片，否则计算 Loss 时维度不匹配
-        #     if 'new_weight_layer_output' in locals():
-        #         new_weight_layer_output = new_weight_layer_output[:keep_rows]
         if self.config.model_name == "blip2":
             original_layer_output = original_layer_output.reshape(2, -1, original_layer_output.size(-1))
             new_weight_layer_output = new_weight_layer_output.reshape(2, -1, new_weight_layer_output.size(-1))
@@ -770,18 +756,18 @@ class WISEMultimodal(WISE):
                 inputs_embeds, attention_mask, targets = self.model.image_encoding(multimodal_inputs[0])
                 img_part = inputs_embeds[:, :32, :] 
                 txt_part = inputs_embeds[:, 32:, :]
-                sample_nums = 1
+                sample_nums = 3
                 noisy_img_sample = []
                 for _ in range(sample_nums):
-                    # 关键修改：每次循环都要产生新的随机掩码
-                    noisy_img_part = F.dropout(img_part, p=0.1, training=True)
-                    perturbed_inputs_embeds = torch.cat([noisy_img_part, txt_part], dim=1)
-                    
-                    # 前向传播干扰样本
-                    self.model.LLM_forward(perturbed_inputs_embeds, attention_mask, targets)
-                    
-                    # 关键修改：在循环内获取并保存当前的输出
-                    # 注意：干扰样本通常不需要 detach，因为我们要优化模型使其在这个扰动下依然靠近 anchor
+                    if True:
+                        # embedding上直接扰动的方法
+                        noisy_img_part = F.dropout(img_part, p=0.1, training=True)
+                        perturbed_inputs_embeds = torch.cat([noisy_img_part, txt_part], dim=1)
+                        self.model.LLM_forward(perturbed_inputs_embeds, attention_mask, targets)
+                    else:
+                        # simCSE实现方法
+                        perturbed_inputs_embeds = copy.deepcopy(inputs_embeds)
+                        self.model.LLM_forward(perturbed_inputs_embeds, attention_mask, targets, using_dropout=True)
                     current_perturbed_output = super().get_adapter_layer().new_weight_layer_output
                     rephrase_samples.append(current_perturbed_output)
                 outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
