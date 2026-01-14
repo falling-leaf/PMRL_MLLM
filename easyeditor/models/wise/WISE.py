@@ -754,15 +754,20 @@ class WISEMultimodal(WISE):
             rephrase_samples = []
             if self.config.using_dropout:
                 inputs_embeds, attention_mask, targets = self.model.image_encoding(multimodal_inputs[0])
-                img_part = inputs_embeds[:, :32, :] 
-                txt_part = inputs_embeds[:, 32:, :]
-                sample_nums = 3
+                img_part = inputs_embeds[:, :-1, :] 
+                txt_part = inputs_embeds[:, -1:, :]
+                # img_part = inputs_embeds[:, :-ans_token_len, :]
+                # txt_part = inputs_embeds[:, -ans_token_len:, :]
+                # img_part = inputs_embeds[:, :32, :] 
+                # txt_part = inputs_embeds[:, 32:, :]
+                sample_nums = 2
                 noisy_img_sample = []
                 for _ in range(sample_nums):
                     if True:
                         # embedding上直接扰动的方法
                         noisy_img_part = F.dropout(img_part, p=0.1, training=True)
                         perturbed_inputs_embeds = torch.cat([noisy_img_part, txt_part], dim=1)
+                        # perturbed_inputs_embeds = noisy_img_part
                         self.model.LLM_forward(perturbed_inputs_embeds, attention_mask, targets)
                     else:
                         # simCSE实现方法
@@ -776,7 +781,114 @@ class WISEMultimodal(WISE):
                 rephrase_samples.append(base_output)
                 # print("base_output shape: ", base_output)
                 # print("perturbed_output shape: ", perturbed_output)
-                pmrl_loss = self.pmrl_loss(rephrase_samples, tau_alignment=self.config.pmrl_tau_alignment, tau_regularization=self.config.pmrl_tau_regularization) * self.config.pmrl_scale
+            elif self.config.using_LAP:
+                if True:
+                    # 对embedding层进行扰动的方法
+                    inputs_embeds, attention_mask, targets = self.model.image_encoding(multimodal_inputs[0])
+                    
+                    # 2. 准备求导环境：Detach -> Clone -> Requires Grad
+                    embeds_for_grad = inputs_embeds.detach().clone()
+                    embeds_for_grad.requires_grad_(True)
+
+                    # 3. 前向传播
+                    outputs = self.model.LLM_forward(embeds_for_grad, attention_mask, targets)
+                    
+                    # =============== 修改重点：健壮的 Logits 提取 ===============
+                    if hasattr(outputs, 'logits'):
+                        logits = outputs.logits
+                    elif isinstance(outputs, tuple):
+                        logits = outputs[0].logits
+                    else:
+                        logits = outputs
+                    # ==========================================================
+
+                    # 4. 计算 Loss
+                    # 注意：这里使用 [...] 而不是 [:-k]，因为我们是单次前向传播，batch_size=1
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = targets[..., 1:].contiguous()
+                    
+                    a = shift_logits.view(-1, shift_logits.size(-1))
+                    b = shift_labels.view(-1)[-ans_token_len:]
+                    a = a[-b.size(0):,:]
+                    
+                    loss_fct_inner = torch.nn.CrossEntropyLoss(reduction='sum')
+                    J_LM = loss_fct_inner(a, b)
+
+                    # 5. 反向传播求导
+                    grad_full = torch.autograd.grad(
+                        outputs=J_LM,
+                        inputs=embeds_for_grad,
+                        retain_graph=False,
+                        only_inputs=True,
+                        allow_unused=True
+                    )[0]
+
+                    # 6. 计算扰动 Delta
+                    grad_base = grad_full[:, :32, :]
+                    epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
+                    
+                    grad_norm = torch.norm(grad_base, dim=-1, keepdim=True) + 1e-8
+                    delta = (grad_base / grad_norm) * epsilon
+                    
+                    # 7. 应用扰动并生成样本 (Rephrase Sample 1)
+                    noisy_img_part = inputs_embeds[:, :32, :] + delta.detach()
+                    txt_part = inputs_embeds[:, 32:, :]
+                    perturbed_inputs_embeds = torch.cat([noisy_img_part, txt_part], dim=1)
+                    
+                    # 再次前向传播以更新 adapter 状态
+                    self.model.LLM_forward(perturbed_inputs_embeds, attention_mask, targets)
+                    perturbed_output = super().get_adapter_layer().new_weight_layer_output
+                    rephrase_samples.append(perturbed_output)
+                else:
+                    # 在编辑层的实现方法（untested）
+                    outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
+                    
+                    a = shift_logits.view(-1, shift_logits.size(-1))
+                    b = shift_labels.view(-1)[-ans_token_len:]
+                    a = a[-b.size(0):,:]
+
+                    base_hidden_state_input = super().get_adapter_layer().hidden_state_input
+                    embeds_for_grad = base_hidden_state_input.detach().clone()
+                    embeds_for_grad.requires_grad_(True)
+                    
+                    loss_fct_inner = torch.nn.CrossEntropyLoss(reduction='sum')
+                    J_LM = loss_fct_inner(a, b)
+
+                    # 5. 反向传播求导
+                    grad_full = torch.autograd.grad(
+                        outputs=J_LM,
+                        inputs=embeds_for_grad,
+                        retain_graph=False,
+                        only_inputs=True,
+                        allow_unused=True
+                    )[0]
+
+                    # 6. 计算扰动 Delta
+                    grad_base = grad_full[:, :32, :]
+                    epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
+                    
+                    grad_norm = torch.norm(grad_base, dim=-1, keepdim=True) + 1e-8
+                    delta = (grad_base / grad_norm) * epsilon
+                    
+                    # 7. 应用扰动并生成样本 (Rephrase Sample 1)
+                    noisy_img_part = base_hidden_state_input[:, :32, :] + delta.detach()
+                    txt_part = base_hidden_state_input[:, 32:, :]
+                    perturbed_inputs_embeds = torch.cat([noisy_img_part, txt_part], dim=1)
+                    
+                    # 再次前向传播以更新 adapter 状态
+                    self.model.LLM_forward(perturbed_inputs_embeds, attention_mask, targets)
+                    perturbed_output = super().get_adapter_layer().new_weight_layer_output
+                    rephrase_samples.append(perturbed_output)
+
+                # 8. 获取 Base Output (Rephrase Sample 2)
+                # 传入原始 embedding 再次前向传播
+                self.model.LLM_forward(inputs_embeds, attention_mask, targets)
+                base_output = super().get_adapter_layer().new_weight_layer_output
+                rephrase_samples.append(base_output.detach())
+
+                # 恢复正常的 outputs 用于函数返回
+                outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
+            pmrl_loss = self.pmrl_loss(rephrase_samples, tau_alignment=self.config.pmrl_tau_alignment, tau_regularization=self.config.pmrl_tau_regularization) * self.config.pmrl_scale
         else:
             outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
 

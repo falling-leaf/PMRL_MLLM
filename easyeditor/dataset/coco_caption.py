@@ -111,11 +111,6 @@ class CaptionDataset(BaseDataset):
             item['multimodal_locality_ground_truth'] = record['m_loc_a']
             item['file_type'] = "image"
 
-            if hasattr(config, 'using_extra'):
-                similar_image_path = os.path.join(self.vis_root, "val2014_image_similar_0/" + record["image_rephrase"].split('/')[-1])
-                similar_image = self.vis_processor(similar_image_path, file_type="image")
-                item['image_similar'] = similar_image
-
             data.append(item)
             
         # if size is not None:

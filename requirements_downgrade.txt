@@ -1,0 +1,31 @@
+torch==2.8.0
+datasets==1.18.3 #running the covariance require 1.18.3 (保留)
+einops==0.8.1
+gpustat==1.1
+hydra-core==1.3.2
+higher==0.2.1
+importlib-metadata==8.7.0
+matplotlib==3.9.4
+nltk==3.6.5
+numpy==1.24.4          # 降级
+omegaconf==2.3.0
+pandas==2.0.3          # 降级
+PyYAML==6.0
+scikit-learn==1.2.2    # 降级
+scipy==1.10.1          # 降级
+sentence-transformers==2.7.0 # 降级
+tokenizers==0.19.1     # 降级
+tqdm==4.62.3
+transformers==4.40.2   # 降级
+openai==2.8.1
+peft==0.10.0           # 降级
+timm==0.9.12           # 降级
+iopath==0.1.10
+opencv-python==4.8.1.78
+fairscale==0.4.13
+av==14.2.0
+qwen_vl_utils==0.0.10
+zhipuai==2.1.5.20250415
+sentencepiece==0.2.0
+pyarrow==14.0.2        # 降级
+rouge==1.0.1
