@@ -180,18 +180,6 @@ def blip2_multimodal_tokenize(batch, processor, device, context_templates=None, 
     edit_loc['prompts_len'] = [len(tok.encode(s, add_special_tokens=False)) for s in loc_prompts]
     edit_loc['labels'] = tok(loc_prompts_labels, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
 
-    if hasattr(hparams, 'using_extra'):
-        similar_image = [item["image_similar"] for item in batch]
-        edit_similar = {}
-        edit_similar['image'] = torch.stack(similar_image, dim=0).to(device)
-
-        # text_input = prompt + target
-        edit_similar['text_input'] = [p + " " + l for p, l in zip(prompts, labels)]
-        edit_similar['labels_text'] = labels  # 先保留原始文本形式
-
-        edit_similar['prompts_len'] = [len(tok.encode(s, add_special_tokens=False)) for s in prompts]
-        edit_similar['labels'] = tok(labels, add_special_tokens=False, return_tensors="pt")["input_ids"].to(device)
-
     # ------------------ locality act/deact masks ------------------
     encoding = tok(edit_inner['text_input'], return_tensors="pt", padding=True, truncation=True)
     tokens = encoding

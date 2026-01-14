@@ -1,22 +1,35 @@
 
 import argparse
+import os
 import torch
+import csv
 from easyeditor import MENDMultimodalTrainingHparams, WISEMultimodalHyperParams, MENDMultimodalHparams
 from easyeditor import CaptionDataset, VQADataset
 from easyeditor import MultimodalEditor, MultimodalTrainer
 from examples.run_adsedit import get_data
+# # 读取数据集的索引json
+# caption_train_path = '/data/jjsu/easyedit/MMEdit/editing-data/caption/caption_train_edit.json'
+# caption_eval_path = '/data/jjsu/easyedit/MMEdit/editing-data/caption/caption_eval_edit.json'
+# vqa_train_path = '/data/jjsu/easyedit/MMEdit/editing-data/vqa/vqa_train.json'
+# vqa_eval_path = '/data/jjsu/easyedit/MMEdit/editing-data/vqa/vqa_eval.json'
+
+# # 模型和数据路径
+# model_path = '/model/jjsu/Model/'
+# data_path = '/data/jjsu/easyedit/MMEdit/'
+# result_path = '/data/jjsu/easyedit/MMEdit/results/'
+
 # 读取数据集的索引json
-caption_train_path = '/data/jjsu/easyedit/MMEdit/editing-data/caption/caption_train_edit.json'
-caption_eval_path = '/data/jjsu/easyedit/MMEdit/editing-data/caption/caption_eval_edit.json'
-vqa_train_path = '/data/jjsu/easyedit/MMEdit/editing-data/vqa/vqa_train.json'
-vqa_eval_path = '/data/jjsu/easyedit/MMEdit/editing-data/vqa/vqa_eval.json'
+caption_train_path = '/root/autodl-tmp/editing-data/caption/caption_train_edit.json'
+caption_eval_path = '/root/autodl-tmp/editing-data/caption/caption_eval_edit.json'
+vqa_train_path = '/root/autodl-tmp/editing-data/vqa/vqa_train.json'
+vqa_eval_path = '/root/autodl-tmp/editing-data/vqa/vqa_eval.json'
 
 # 模型和数据路径
-model_path = '/model/jjsu/Model/'
-data_path = '/data/jjsu/easyedit/MMEdit/'
-result_path = '/data/jjsu/easyedit/MMEdit/results/'
+model_path = '/root/autodl-tmp/model/'
+data_path = '/root/autodl-tmp/MMEdit_images/'
+result_path = '/root/autodl-tmp/results/'
 
-# easyedit python3 start_code.py --device 7 --sub_device 7 --method wise --model blip2 --ds caption
+# easyedit python3 start_code.py --device 0 --sub_device 0 --method wise --model blip2 --ds caption
 # easyedit_1 python3 start_code.py --device 6 --sub_device 6 --method vqa --model blip2 --ds caption
 # easyedit_2 python3 start_code.py --device 3 --sub_device 6 --method mend --model qwen --ds caption
 # easyedit_3 python3 start_code.py --device 0 --sub_device 0 --method wise --model minigpt4 --ds caption
@@ -81,6 +94,7 @@ def apply_wise_method(args):
         hparams.tokenizer_name = model_path + "opt-2.7b"
         hparams.qformer_checkpoint = model_path + 'blip2_pretrained_opt2.7b.pth'
         hparams.state_dict_file = model_path + 'eva_vit_g.pth'
+        hparams.qformer_name_or_path = model_path + 'bert-base-uncased'
     elif args.model == 'minigpt4':
         hparams = WISEMultimodalHyperParams.from_hparams('./hparams/WISE/minigpt4.yaml')
         hparams.name = model_path + 'Vicuna'
@@ -107,11 +121,11 @@ def apply_wise_method(args):
     hparams.sub_device = int(args.sub_device)
 
     hparams.using_extra = True
-    hparams.using_dropout = True
-    hparams.using_LAP = False
-    hparams.pmrl_tau_alignment = 0.5
+    hparams.using_dropout = False
+    hparams.using_LAP = True
+    hparams.pmrl_tau_alignment = args.pmrl_tau_alignment
     hparams.pmrl_tau_regularization = 0.1
-    hparams.pmrl_scale = 0.5
+    hparams.pmrl_scale = args.pmrl_scale
 
     if args.ds == 'caption':
         train_ds = CaptionDataset(caption_train_path, config=hparams, size=100)
@@ -135,8 +149,45 @@ def apply_wise_method(args):
         gen += case["post"]["image_rephrase_acc"].item()
         t_loc += case["post"]["locality_acc"].item()
         i_loc += case["post"]["multimodal_locality_acc"].item()
+    
+    rewrite_acc = acc/len(metrics)
+    rephrase_acc = gen/len(metrics)
+    text_loc_acc = t_loc/len(metrics)
+    image_loc_acc = i_loc/len(metrics)
+    
+    # Print original console output
     print("-------------------- Final Results -------------------")
-    print(f"Rewrite Acc: {acc/len(metrics)}, Rephrase Acc: {gen/len(metrics)}, Text Loc Acc: {t_loc/len(metrics)}, Image Loc Acc: {i_loc/len(metrics)}")
+    print(f"Rewrite Acc: {rewrite_acc}, Rephrase Acc: {rephrase_acc}, Text Loc Acc: {text_loc_acc}, Image Loc Acc: {image_loc_acc}")
+    
+    # Create single CSV log file path
+    csv_filename = "results.csv"
+    csv_filepath = os.path.join(result_path, csv_filename)
+    
+    # Write results to single CSV file in result_path
+    os.makedirs(result_path, exist_ok=True)  # Ensure directory exists
+    file_exists = os.path.exists(csv_filepath)
+    with open(csv_filepath, 'a', newline='') as csvfile:  # Using append mode to add to existing file
+        fieldnames = ['method', 'model', 'dataset', 'device', 'sub_device', 'acc', 'gen', 't-loc', 'i-loc', 'PMRL_scale', 'PMRL_tau']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        
+        # Write header only if file doesn't exist yet
+        if not file_exists:
+            writer.writeheader()
+        
+        # Write the results row
+        writer.writerow({
+            'method': args.method,
+            'model': args.model,
+            'dataset': args.ds,
+            'device': args.device,
+            'sub_device': args.sub_device,
+            'acc': rewrite_acc,
+            'gen': rephrase_acc,
+            't-loc': text_loc_acc,
+            'i-loc': image_loc_acc,
+            'PMRL_scale': args.pmrl_scale,
+            'PMRL_tau': args.pmrl_tau_alignment
+        })
 
 
 def main():
@@ -161,6 +212,13 @@ def main():
     # 添加数据集类型参数
     parser.add_argument('--ds', type=str, default='caption', choices=['caption', 'vqa'],
                        help='Type of dataset to use: caption or vqa')
+    
+    # 添加pmrl_tau_alignment和pmrl_scale参数
+    parser.add_argument('--pmrl_tau_alignment', type=float, default=0.5,
+                       help='PMRL tau alignment parameter (default: 0.5)')
+    
+    parser.add_argument('--pmrl_scale', type=float, default=0.5,
+                       help='PMRL scale parameter (default: 0.5)')
     
     # 解析参数
     args = parser.parse_args()
