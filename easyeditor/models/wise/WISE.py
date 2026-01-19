@@ -784,8 +784,7 @@ class WISEMultimodal(WISE):
             elif self.config.using_LAP:
                 if True:
                     # 0. 获取生成数量，默认为1
-                    num_rephrase = getattr(self.config, 'num_rephrase', 6)
-                    print("num_rephrase: ", num_rephrase)
+                    num_rephrase = getattr(self.config, 'num_rephrase', 5)
 
                     # 1. 基础编码（仅需一次）
                     # 对embedding层进行扰动的方法
@@ -827,8 +826,10 @@ class WISEMultimodal(WISE):
                         allow_unused=True
                     )[0]
 
-                    # grad_base = grad_full[:, :32, :]
-                    grad_base = grad_full[:, :-ans_token_len, :]
+                    if self.config.using_imageembedding:
+                        print("using_imageembedding")
+                        grad_base = grad_full[:, :32, :]
+                    else: grad_base = grad_full[:, :-ans_token_len, :]
                     epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
 
                     # 6. 循环生成多个样本
@@ -841,10 +842,12 @@ class WISEMultimodal(WISE):
                         
                         # 7. 应用扰动并生成样本
                         # 使用 detach() 确保扰动后的输入是从新的计算图开始的
-                        # noisy_img_part = inputs_embeds[:, :32, :].detach() + delta.detach()
-                        # txt_part = inputs_embeds[:, 32:, :].detach()
-                        noisy_img_part = inputs_embeds[:, :-ans_token_len, :].detach() + delta.detach()
-                        txt_part = inputs_embeds[:, -ans_token_len:, :].detach()
+                        if self.config.using_imageembedding:
+                            noisy_img_part = inputs_embeds[:, :32, :].detach() + delta.detach()
+                            txt_part = inputs_embeds[:, 32:, :].detach()
+                        else:
+                            noisy_img_part = inputs_embeds[:, :-ans_token_len, :].detach() + delta.detach()
+                            txt_part = inputs_embeds[:, -ans_token_len:, :].detach()
                         perturbed_inputs_embeds = torch.cat([noisy_img_part, txt_part], dim=1)
                         
                         # 确保 requires_grad 根据需要开启（如果后续还需要对这个前向过程求导）

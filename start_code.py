@@ -128,6 +128,7 @@ def apply_wise_method(args):
     hparams.pmrl_tau_regularization = 0.1
     hparams.pmrl_scale = args.pmrl_scale
     hparams.num_rephrase = args.num_rephrase
+    hparams.using_imageembedding = args.using_imageembedding
 
 
 
@@ -171,7 +172,7 @@ def apply_wise_method(args):
     os.makedirs(result_path, exist_ok=True)  # Ensure directory exists
     file_exists = os.path.exists(csv_filepath)
     with open(csv_filepath, 'a', newline='') as csvfile:  # Using append mode to add to existing file
-        fieldnames = ['method', 'model', 'dataset', 'acc', 'gen', 't-loc', 'i-loc', 'PMRL_scale', 'PMRL_tau', 'num_rephrase']
+        fieldnames = ['method', 'model', 'dataset', 'acc', 'gen', 't-loc', 'i-loc', 'PMRL_scale', 'PMRL_tau', 'num_rephrase', 'using_imageembedding']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         # Write header only if file doesn't exist yet
@@ -189,7 +190,8 @@ def apply_wise_method(args):
             'i-loc': image_loc_acc,
             'PMRL_scale': args.pmrl_scale,
             'PMRL_tau': args.pmrl_tau_alignment,
-            'num_rephrase': args.num_rephrase
+            'num_rephrase': args.num_rephrase,
+            'using_imageembedding': args.using_imageembedding
         })
 
 
@@ -225,6 +227,9 @@ def main():
 
     parser.add_argument('--num_rephrase', type=int, default=2,
                        help='Number of rephrases to use (default: 6)')
+
+    parser.add_argument('--using_imageembedding', action='store_true',
+                       help='Use image embedding (default: False)')
     
     # 解析参数
     args = parser.parse_args()

@@ -15,7 +15,7 @@ for alignment in "${alignment_values[@]}"; do
     for scale in "${scale_values[@]}"; do
         for num_rephrase in "${num_rephrase_values[@]}"; do
             echo "Running with pmrl_tau_alignment=$alignment, pmrl_scale=$scale, num_rephrase=$num_rephrase"
-            python3 start_code.py --device 0 --sub_device 0 --method wise --model blip2 --ds vqa --pmrl_tau_alignment $alignment --pmrl_scale $scale --num_rephrase $num_rephrase
+            python3 start_code.py --device 0 --sub_device 0 --method wise --model blip2 --ds caption --pmrl_tau_alignment $alignment --pmrl_scale $scale --num_rephrase $num_rephrase --using_imageembedding
             echo "Completed run with pmrl_tau_alignment=$alignment, pmrl_scale=$scale, num_rephrase=$num_rephrase"
             echo "----------------------------------------"
         done
