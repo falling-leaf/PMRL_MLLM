@@ -31,7 +31,7 @@ result_path = '/root/autodl-tmp/results/'
 
 # easyedit python3 start_code.py --device 0 --sub_device 0 --method wise --model blip2 --ds caption
 # easyedit_1 python3 start_code.py --device 6 --sub_device 6 --method vqa --model blip2 --ds caption
-# easyedit_2 python3 start_code.py --device 3 --sub_device 6 --method mend --model qwen --ds caption
+# easyedit_2 python3 start_code.py --device 0 --sub_device 0 --method mend --model blip2 --ds vqa
 # easyedit_3 python3 start_code.py --device 0 --sub_device 0 --method wise --model minigpt4 --ds caption
 # easyedit_4 python3 start_code.py --device 6 --sub_device 6 --method wise --model minigpt4 --ds vqa
 # easyedit_5 python3 start_code.py --device 7 --sub_device 7 --method wise --model qwen --ds caption
@@ -44,6 +44,7 @@ def apply_mend_method(args):
         training_hparams.tokenizer_name = model_path + 'opt-2.7b'
         training_hparams.qformer_checkpoint = model_path + 'blip2_pretrained_opt2.7b.pth'
         training_hparams.state_dict_file = model_path + 'eva_vit_g.pth'
+        training_hparams.qformer_name_or_path = model_path + 'bert-base-uncased'
     elif args.model == 'qwen':
         training_hparams = MENDMultimodalTrainingHparams.from_hparams('./hparams/TRAINING/MEND/qwen2vl-7b.yaml')
         training_hparams.name = model_path + 'qwen2-vl-7b'
@@ -126,6 +127,9 @@ def apply_wise_method(args):
     hparams.pmrl_tau_alignment = args.pmrl_tau_alignment
     hparams.pmrl_tau_regularization = 0.1
     hparams.pmrl_scale = args.pmrl_scale
+    hparams.num_rephrase = args.num_rephrase
+
+
 
     if args.ds == 'caption':
         train_ds = CaptionDataset(caption_train_path, config=hparams, size=100)
@@ -150,10 +154,10 @@ def apply_wise_method(args):
         t_loc += case["post"]["locality_acc"].item()
         i_loc += case["post"]["multimodal_locality_acc"].item()
     
-    rewrite_acc = acc/len(metrics)
-    rephrase_acc = gen/len(metrics)
-    text_loc_acc = t_loc/len(metrics)
-    image_loc_acc = i_loc/len(metrics)
+    rewrite_acc = acc/len(metrics) * 100
+    rephrase_acc = gen/len(metrics) * 100
+    text_loc_acc = t_loc/len(metrics) * 100
+    image_loc_acc = i_loc/len(metrics) * 100
     
     # Print original console output
     print("-------------------- Final Results -------------------")
@@ -167,7 +171,7 @@ def apply_wise_method(args):
     os.makedirs(result_path, exist_ok=True)  # Ensure directory exists
     file_exists = os.path.exists(csv_filepath)
     with open(csv_filepath, 'a', newline='') as csvfile:  # Using append mode to add to existing file
-        fieldnames = ['method', 'model', 'dataset', 'device', 'sub_device', 'acc', 'gen', 't-loc', 'i-loc', 'PMRL_scale', 'PMRL_tau']
+        fieldnames = ['method', 'model', 'dataset', 'acc', 'gen', 't-loc', 'i-loc', 'PMRL_scale', 'PMRL_tau', 'num_rephrase']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         # Write header only if file doesn't exist yet
@@ -179,14 +183,13 @@ def apply_wise_method(args):
             'method': args.method,
             'model': args.model,
             'dataset': args.ds,
-            'device': args.device,
-            'sub_device': args.sub_device,
             'acc': rewrite_acc,
             'gen': rephrase_acc,
             't-loc': text_loc_acc,
             'i-loc': image_loc_acc,
             'PMRL_scale': args.pmrl_scale,
-            'PMRL_tau': args.pmrl_tau_alignment
+            'PMRL_tau': args.pmrl_tau_alignment,
+            'num_rephrase': args.num_rephrase
         })
 
 
@@ -219,6 +222,9 @@ def main():
     
     parser.add_argument('--pmrl_scale', type=float, default=0.5,
                        help='PMRL scale parameter (default: 0.5)')
+
+    parser.add_argument('--num_rephrase', type=int, default=2,
+                       help='Number of rephrases to use (default: 6)')
     
     # 解析参数
     args = parser.parse_args()
