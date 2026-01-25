@@ -10,6 +10,7 @@ from torch import Tensor
 from torch.nn import CrossEntropyLoss
 from transformers.activations import ACT2FN
 from .merge import slerp, GTA, linear
+from .MMD_loss import MMD_loss
 import torch.nn as nn
 import gc
 
@@ -46,6 +47,8 @@ def euc(query, key, config, act_mask=None, infer=False):
 class WISE(torch.nn.Module):
     def __init__(self, config, model, device):
         super(WISE, self).__init__()
+        self.mmd_loss = MMD_loss(kernel_type='cosine')
+        self.generate_rephrase_sample = True
         self.config = config
         self.model = model
         self.config = config
@@ -643,6 +646,102 @@ class WISEMultimodal(WISE):
             if type(self.config.norm_constraint) is float:
                 super()._norm_constraint(self.config.norm_constraint)
 
+            if i == 9:
+                # 0. 获取生成数量，默认为1
+                num_rephrase = 10
+                rephrase_samples = []
+                # 1. 基础编码（仅需一次）
+                # 对embedding层进行扰动的方法
+                inputs_embeds, attention_mask, targets = self.model.image_encoding(multimodal_inputs[0])
+
+                # 2. 准备求导环境：Detach -> Clone -> Requires Grad
+                embeds_for_grad = inputs_embeds.detach().clone()
+                embeds_for_grad.requires_grad_(True)
+
+                # 3. 前向传播计算梯度基础
+                outputs = self.model.LLM_forward(embeds_for_grad, attention_mask, targets)
+
+                # =============== 健壮的 Logits 提取 ===============
+                if hasattr(outputs, 'logits'):
+                    logits = outputs.logits
+                elif isinstance(outputs, tuple):
+                    logits = outputs[0].logits
+                else:
+                    logits = outputs
+                # ==========================================================
+
+                # 4. 计算 Loss
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = targets[..., 1:].contiguous()
+
+                a = shift_logits.view(-1, shift_logits.size(-1))
+                b = shift_labels.view(-1)[-ans_token_len:]
+                a = a[-b.size(0):,:]
+
+                loss_fct_inner = torch.nn.CrossEntropyLoss(reduction='sum')
+                J_LM = loss_fct_inner(a, b)
+
+                # 5. 反向传播获取基础梯度
+                grad_full = torch.autograd.grad(
+                    outputs=J_LM,
+                    inputs=embeds_for_grad,
+                    retain_graph=False,
+                    only_inputs=True,
+                    allow_unused=True
+                )[0]
+
+                if self.config.using_imageembedding:
+                    print("using_imageembedding")
+                    grad_base = grad_full[:, :32, :]
+                else: grad_base = grad_full[:, :-ans_token_len, :]
+                base_epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
+
+                epsilon_list = torch.linspace(
+                    base_epsilon,
+                    base_epsilon * num_rephrase,
+                    steps=num_rephrase,
+                    device=grad_base.device,
+                    dtype=grad_base.dtype
+                )
+
+                # 6. 循环生成多个样本
+                for i in range(num_rephrase):
+                    # 计算扰动 Delta
+                    # 注意：如果需要每个样本不同，通常在这里加入随机噪声，例如：
+                    # noise = torch.randn_like(grad_base) * some_scale
+                    epsilon = epsilon_list[i]
+                    grad_norm = torch.norm(grad_base, dim=-1, keepdim=True) + 1e-8
+                    delta = (grad_base / grad_norm) * epsilon
+                    
+                    # 7. 应用扰动并生成样本
+                    # 使用 detach() 确保扰动后的输入是从新的计算图开始的
+                    if self.config.using_imageembedding:
+                        noisy_img_part = inputs_embeds[:, :32, :].detach() + delta.detach()
+                        txt_part = inputs_embeds[:, 32:, :].detach()
+                    else:
+                        noisy_img_part = inputs_embeds[:, :-ans_token_len, :].detach() + delta.detach()
+                        txt_part = inputs_embeds[:, -ans_token_len:, :].detach()
+                    perturbed_inputs_embeds = torch.cat([noisy_img_part, txt_part], dim=1)
+                    
+                    # 确保 requires_grad 根据需要开启（如果后续还需要对这个前向过程求导）
+                    # perturbed_inputs_embeds.requires_grad_(True) 
+
+                    # 8. 独立前向传播以更新 adapter 状态并获取输出
+                    # 每次调用都会进入该次循环所属的独立计算图
+                    self.model.LLM_forward(perturbed_inputs_embeds, attention_mask, targets)
+                    
+                    # 获取当前前向传播捕获的特定层输出
+                    perturbed_output = super().get_adapter_layer().new_weight_layer_output
+                    rephrase_samples.append(perturbed_output)
+                    # 将 rephrase_samples 中的每个 tensor 分别保存到本地文件，文件名按索引递增
+                    save_dir = "/root/PMRL_MLLM/saved_rephrase_samples"
+                    import os
+                    os.makedirs(save_dir, exist_ok=True)
+                    for idx, tensor in enumerate(rephrase_samples):
+                        file_path = os.path.join(save_dir, f"rephrase_sample_{idx:03d}.pt")
+                        torch.save(tensor.detach().cpu(), file_path)
+                        print(f"Rephrase sample {idx} saved to {file_path}")
+
         # --- pull out info we want to log from the Wise layer ---
         setattr(eval(f"self.model.{self.layer}"), "editing", False)
         setattr(eval(f"self.model.{self.layer}"), "training", False)
@@ -730,14 +829,27 @@ class WISEMultimodal(WISE):
         else: 
             outputs = self.model(**multimodal_inputs)
             logits = outputs.logits
+            labels = []
             # 这里事实上是将acc和loc放在了两个batch上，然后来跑
             shift_labels = multimodal_inputs['input_ids'][:-k, 1:].contiguous()
             shift_logits = logits[:-k, :-1, :].contiguous()
             bs = text_tokens["input_ids"].shape[0] - k
         return outputs, logits, labels, shift_labels, shift_logits, bs
 
+    def mllm_forward_llava(self, inputs_embeds, labels, ans_token_len):
+        """专门为 LLaVA 优化的 forward，直接接收 embeds"""
+        outputs = self.model(inputs_embeds=inputs_embeds, return_dict=True)
+        logits = outputs.logits
+        
+        shift_labels = labels[:, 1:].contiguous()
+        shift_logits = logits[:, :-1, :].contiguous()
+        bs = labels.shape[0]
+        
+        return outputs, logits, labels, shift_labels, shift_logits, bs
+
 
     def _cal_ft_loss(self, multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len):
+        # print(multimodal_inputs)
         if hasattr(self.model.config, 'batch_size'):
             k = self.config.batch_size
         else:
@@ -746,7 +858,235 @@ class WISEMultimodal(WISE):
         if k != 1:
             raise AssertionError("Not support Batch Edit")
         
+        # if self.generate_rephrase_sample:
+        #     self.generate_rephrase_sample = False
+        #     # 0. 获取生成数量，默认为1
+        #     num_rephrase = getattr(self.config, 'num_rephrase', 5)
+
+        #     # 1. 基础编码（仅需一次）
+        #     # 对embedding层进行扰动的方法
+        #     inputs_embeds, attention_mask, targets = self.model.image_encoding(multimodal_inputs[0])
+
+        #     # 2. 准备求导环境：Detach -> Clone -> Requires Grad
+        #     embeds_for_grad = inputs_embeds.detach().clone()
+        #     embeds_for_grad.requires_grad_(True)
+
+        #     # 3. 前向传播计算梯度基础
+        #     outputs = self.model.LLM_forward(embeds_for_grad, attention_mask, targets)
+
+        #     # =============== 健壮的 Logits 提取 ===============
+        #     if hasattr(outputs, 'logits'):
+        #         logits = outputs.logits
+        #     elif isinstance(outputs, tuple):
+        #         logits = outputs[0].logits
+        #     else:
+        #         logits = outputs
+        #     # ==========================================================
+
+        #     # 4. 计算 Loss
+        #     shift_logits = logits[..., :-1, :].contiguous()
+        #     shift_labels = targets[..., 1:].contiguous()
+
+        #     a = shift_logits.view(-1, shift_logits.size(-1))
+        #     b = shift_labels.view(-1)[-ans_token_len:]
+        #     a = a[-b.size(0):,:]
+
+        #     loss_fct_inner = torch.nn.CrossEntropyLoss(reduction='sum')
+        #     J_LM = loss_fct_inner(a, b)
+
+        #     # 5. 反向传播获取基础梯度
+        #     grad_full = torch.autograd.grad(
+        #         outputs=J_LM,
+        #         inputs=embeds_for_grad,
+        #         retain_graph=False,
+        #         only_inputs=True,
+        #         allow_unused=True
+        #     )[0]
+
+        #     if self.config.using_imageembedding:
+        #         print("using_imageembedding")
+        #         grad_base = grad_full[:, :32, :]
+        #     else: grad_base = grad_full[:, :-ans_token_len, :]
+        #     epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
+
+        #     # 6. 循环生成多个样本
+        #     for i in range(num_rephrase):
+        #         # 计算扰动 Delta
+        #         # 注意：如果需要每个样本不同，通常在这里加入随机噪声，例如：
+        #         # noise = torch.randn_like(grad_base) * some_scale
+        #         grad_norm = torch.norm(grad_base, dim=-1, keepdim=True) + 1e-8
+        #         delta = (grad_base / grad_norm) * epsilon
+                
+        #         # 7. 应用扰动并生成样本
+        #         # 使用 detach() 确保扰动后的输入是从新的计算图开始的
+        #         if self.config.using_imageembedding:
+        #             noisy_img_part = inputs_embeds[:, :32, :].detach() + delta.detach()
+        #             txt_part = inputs_embeds[:, 32:, :].detach()
+        #         else:
+        #             noisy_img_part = inputs_embeds[:, :-ans_token_len, :].detach() + delta.detach()
+        #             txt_part = inputs_embeds[:, -ans_token_len:, :].detach()
+        #         perturbed_inputs_embeds = torch.cat([noisy_img_part, txt_part], dim=1)
+        #         # 保存 perturbed_inputs_embeds，按顺序命名文件
+        #         save_dir = "/home/jjsu/why/saved_perturbed_embeds"
+        #         import os
+        #         os.makedirs(save_dir, exist_ok=True)
+        #         file_name = f"perturbed_inputs_embeds_{i:03d}.pt"
+        #         torch.save(perturbed_inputs_embeds, os.path.join(save_dir, file_name))
+        #         print(f"Perturbed embeds saved to {os.path.join(save_dir, file_name)}")
+
         pmrl_loss = torch.tensor(0.0, device=self.device if hasattr(self, 'device') else multimodal_inputs['input_ids'].device)
+        # ==========================================
+        # 针对 Llava-OV 的万能拼接逻辑 (手动替换 <image> Token)
+        # ==========================================
+        if "llava" in self.config.model_name.lower():
+            rephrase_samples = []
+            
+            with torch.no_grad():
+                # 1. 获取基础文本 Embedding
+                # shape: [batch, seq_len, embed_dim]
+                inputs_embeds = self.model.get_input_embeddings()(multimodal_inputs['input_ids'])
+                
+                # 2. 获取视觉特征 (之前的修复逻辑)
+                pixel_values = multimodal_inputs['pixel_values'].to(self.model.dtype)
+                if pixel_values.ndim == 5:
+                    bs, num_patches, channel, height, width = pixel_values.shape
+                    pixel_values = pixel_values.view(bs * num_patches, channel, height, width)
+                
+                image_outputs = self.model.model.vision_tower(pixel_values, output_hidden_states=True)
+                selected_image_feature = image_outputs.last_hidden_state
+                image_features = self.model.model.multi_modal_projector(selected_image_feature)
+                
+                # 3. 手动执行合并逻辑
+                # Llava-OV 的 input_ids 中，图像占位符通常是特定的 ID (self.config.image_token_index)
+                # 我们需要把 image_features 填到 inputs_embeds 中对应的位置
+                # 注意：Llava-OV 可能存在多个图像 Token 对应多个视觉特征块
+                
+                # 调用 transformers 提供的统一 pack 接口（这是 Llava-OV 最新的标准做法）
+                # 如果这个接口还报错，说明 transformers 版本非常特殊，我们将回退到 forward 逻辑
+                try:
+                    (
+                        final_inputs_embeds,
+                        final_attention_mask,
+                        final_labels,
+                        _ , _
+                    ) = self.model.pack_multimodal_resources(
+                        input_ids=multimodal_inputs['input_ids'],
+                        image_features=[image_features], # 期望列表
+                        attention_mask=multimodal_inputs['attention_mask'],
+                        labels=multimodal_inputs.get('labels'),
+                        image_sizes=multimodal_inputs.get('image_sizes')
+                    )
+                except AttributeError:
+                    # 如果 pack_multimodal_resources 也不存在，使用最原始的 forward 拦截法
+                    # 这种方法虽然略慢，但 100% 避开了 API 变动问题
+                    outputs = self.model(
+                        input_ids=multimodal_inputs['input_ids'],
+                        pixel_values=multimodal_inputs['pixel_values'],
+                        image_sizes=multimodal_inputs.get('image_sizes'),
+                        attention_mask=multimodal_inputs.get('attention_mask'),
+                        labels=multimodal_inputs.get('labels'),
+                        output_hidden_states=True,
+                        return_dict=True
+                    )
+                    # 直接从 forward 结果中提取已经拼接好的向量
+                    # 注意：这需要模型版本支持在 forward 中返回 inputs_embeds 
+                    # 或者我们通过 outputs.hidden_states[0] 获取第一层的输入（通常就是 inputs_embeds）
+                    final_inputs_embeds = outputs.hidden_states[0]
+                    final_attention_mask = multimodal_inputs.get('attention_mask')
+                    final_labels = multimodal_inputs.get('labels')
+
+                base_inputs_embeds = final_inputs_embeds
+                current_attention_mask = final_attention_mask
+                current_labels = final_labels
+
+            if self.config.using_extra and self.config.using_LAP:
+                # 此时 base_inputs_embeds 已经是拼接好的完整向量了
+                embeds_for_grad = base_inputs_embeds.detach().clone().requires_grad_(True)
+                
+                # 这里的调用不再传像素，只传拼接好的向量
+                outputs = self.model(
+                    inputs_embeds=embeds_for_grad,
+                    attention_mask=current_attention_mask,
+                    labels=current_labels,
+                    return_dict=True
+                )
+                
+                # 获取用于求导的 Loss
+                # 如果 outputs.loss 存在则直接用，否则手动算
+                if outputs.loss is not None:
+                    J_LM = outputs.loss
+                else:
+                    logits = outputs.logits
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = current_labels[..., 1:].contiguous()
+                    loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
+                    J_LM = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+                # 3. 计算针对 Embedding 的梯度
+                grad_full = torch.autograd.grad(
+                    outputs=J_LM,
+                    inputs=embeds_for_grad,
+                    retain_graph=False
+                )[0]
+
+                # 5. 动态定位扰动区域 (避开答案部分)
+                # LLaVA-OV 的结构通常是 [Images, Prompts, Answers]
+                # 我们对末尾 ans_token_len 之前的区域加扰动
+                grad_base = grad_full[:, :-ans_token_len, :]
+                epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
+                num_rephrase = getattr(self.config, 'num_rephrase', 1)
+
+                for i in range(num_rephrase):
+                    # 计算扰动 Delta
+                    grad_norm = torch.norm(grad_base, dim=-1, keepdim=True) + 1e-8
+                    delta = (grad_base / grad_norm) * epsilon
+                    
+                    # 应用扰动并拼接回答案部分
+                    noisy_img_prompt = base_inputs_embeds[:, :-ans_token_len, :].detach() + delta.detach()
+                    ans_part = base_inputs_embeds[:, -ans_token_len:, :].detach()
+                    perturbed_inputs_embeds = torch.cat([noisy_img_prompt, ans_part], dim=1)
+                    
+                    # 6. 第二次前向传播：提取扰动后的 Hidden States
+                    self.model(
+                        inputs_embeds=perturbed_inputs_embeds, 
+                        attention_mask=current_attention_mask
+                    )
+                    # 提取 Adapter 层的输出 (假设已有 Hook 记录)
+                    perturbed_output = super().get_adapter_layer().new_weight_layer_output
+                    rephrase_samples.append(perturbed_output)
+
+                # 7. 获取原始状态作为对照组
+                self.model(
+                    inputs_embeds=base_inputs_embeds, 
+                    attention_mask=current_attention_mask
+                )
+                base_output = super().get_adapter_layer().new_weight_layer_output
+                rephrase_samples.append(base_output.detach())
+
+                # 8. 计算 PMRL Loss (Alignment + Regularization)
+                diff = torch.norm(rephrase_samples[0] - rephrase_samples[-1])
+                print(f"DEBUG: Sample difference norm: {diff.item()}")
+                pmrl_loss = self.pmrl_loss(
+                    rephrase_samples, 
+                    tau_alignment=self.config.pmrl_tau_alignment, 
+                    tau_regularization=self.config.pmrl_tau_regularization
+                ) * self.config.pmrl_scale
+
+            # # 9. 最终的 FT Loss 计算
+            # # 这里的 outputs 来自第 7 步的原始输入传播
+            outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
+            print(f"pmrl_loss: {pmrl_loss.item()}")
+    
+            loss_fct = CrossEntropyLoss(reduction='none')
+            a = shift_logits.view(-1, shift_logits.size(-1))
+            b = shift_labels.view(-1)[-ans_token_len:]
+            a = a[-b.size(0):,:]
+            loss = loss_fct(a, b)
+            loss = loss.view(bs, -1)
+            label_mask = torch.ones_like(loss, dtype=torch.bool)        
+            ft_loss = ((loss * label_mask).sum(1) / label_mask.sum(1)).mean()
+
+            return ft_loss + pmrl_loss
 
         if self.config.using_extra:
             # blip2中，前32个token是image embedding
@@ -766,6 +1106,7 @@ class WISEMultimodal(WISE):
                     if True:
                         # embedding上直接扰动的方法
                         noisy_img_part = F.dropout(img_part, p=0.1, training=True)
+                        # noisy_img_part = img_part
                         perturbed_inputs_embeds = torch.cat([noisy_img_part, txt_part], dim=1)
                         # perturbed_inputs_embeds = noisy_img_part
                         self.model.LLM_forward(perturbed_inputs_embeds, attention_mask, targets)
@@ -905,15 +1246,18 @@ class WISEMultimodal(WISE):
                 # 传入原始 embedding 再次前向传播
                 self.model.LLM_forward(inputs_embeds, attention_mask, targets)
                 base_output = super().get_adapter_layer().new_weight_layer_output
+                # print("base_output.shape:", base_output.shape)
                 rephrase_samples.append(base_output.detach())
 
                 # 恢复正常的 outputs 用于函数返回
                 outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
+            # mmd_loss = self.mmd_loss(rephrase_samples[0], rephrase_samples[1])
             pmrl_loss = self.pmrl_loss(rephrase_samples, tau_alignment=self.config.pmrl_tau_alignment, tau_regularization=self.config.pmrl_tau_regularization) * self.config.pmrl_scale
         else:
             outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
 
         print(f"pmrl_loss: {pmrl_loss.item()}")
+        # print(f"mmd_loss: {mmd_loss.item()}")
 
 
         # only cal loss of target text tokens
@@ -926,53 +1270,4 @@ class WISEMultimodal(WISE):
         label_mask = torch.ones_like(loss, dtype=torch.bool)        
         ft_loss = ((loss * label_mask).sum(1) / label_mask.sum(1)).mean()
         return ft_loss + pmrl_loss
-
-            # elif self.config.using_LAP:
-            #     # --- 1. 获取基础特征（保持在计算图中） ---
-
-            #     # --- 2. 独立计算 delta（不使用显式 lm_head） ---
-            #     # 找到 answer 对应的 logits 部分
-                
-            #     a = shift_logits.view(-1, shift_logits.size(-1))
-            #     b = shift_labels.view(-1)[-ans_token_len:]
-            #     a = a[-b.size(0):,:]
-            #     # 计算用于探测方向的临时 Loss
-            #     # 注意：这个 Loss 必须是在计算图上的
-            #     loss_fct_inner = torch.nn.CrossEntropyLoss(reduction='sum')
-            #     J_LM = loss_fct_inner(a, b)
-
-            #     # 核心：直接对中间变量 self.hidden_states 求导
-            #     # retain_graph=True 是必须的，因为后面真正的 ft_loss 还需要用到这个计算图
-            #     grad_full = torch.autograd.grad(
-            #         outputs=J_LM,
-            #         inputs=self.hidden_states,
-            #         retain_graph=True,
-            #         only_inputs=True,
-            #         allow_unused=True
-            #     )[0]
-
-            #     if grad_full is not None:
-            #         # 截取对应 answer token 位置的梯度
-            #         # grad_base = grad_full[0, -ans_token_len:, :]
-            #         grad_base = grad_full[0, :-ans_token_len, :]
-                    
-            #         # 构造 delta 数值（剥离计算图）
-            #         epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
-            #         # 使用 .data 确保 delta 是纯数值，不带梯度
-            #         delta = (grad_base.data / (torch.norm(grad_base.data) + 1e-8)) * epsilon
-            #         # print(delta)
-            #     else:
-            #         delta = torch.zeros_like(base_features.data)
-
-            #     # --- 3. 构造 PMRL 视图 ---
-            #     # 锚点视图：关联计算图，用于传导 pmrl_loss 的梯度回到模型
-            #     view_anchor = base_features 
-                
-            #     # 对抗视图：锚点数值 + 偏移量，并完全 detach
-            #     # 它作为 PMRL 的“静态目标”
-            #     view_adversarial = (base_features.data + delta).detach()
-
-            #     rephrase_samples = [view_anchor, view_adversarial]
-            # else:
-            #     raise ValueError("unknown method")
-            # 计算 PMRL Loss
+        # return ft_loss + mmd_loss

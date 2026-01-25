@@ -7,6 +7,9 @@ from easyeditor import MENDMultimodalTrainingHparams, WISEMultimodalHyperParams,
 from easyeditor import CaptionDataset, VQADataset
 from easyeditor import MultimodalEditor, MultimodalTrainer
 from examples.run_adsedit import get_data
+# 各种模型配置速记
+# modelscope download --model Qwen/Qwen2-VL-7B --local_dir ./qwen2-vl-7b
+# 
 # # 读取数据集的索引json
 # caption_train_path = '/data/jjsu/easyedit/MMEdit/editing-data/caption/caption_train_edit.json'
 # caption_eval_path = '/data/jjsu/easyedit/MMEdit/editing-data/caption/caption_eval_edit.json'
@@ -29,6 +32,7 @@ model_path = '/root/autodl-tmp/model/'
 data_path = '/root/autodl-tmp/MMEdit_images/'
 result_path = '/root/autodl-tmp/results/'
 
+# python3 start_code.py --device 0 --sub_device 0 --method wise --model blip2 --ds caption --pmrl_tau_alignment 8 --pmrl_scale 25 --num_rephrase 3
 # easyedit python3 start_code.py --device 0 --sub_device 0 --method wise --model blip2 --ds caption
 # easyedit_1 python3 start_code.py --device 6 --sub_device 6 --method vqa --model blip2 --ds caption
 # easyedit_2 python3 start_code.py --device 0 --sub_device 0 --method mend --model blip2 --ds vqa
@@ -121,21 +125,27 @@ def apply_wise_method(args):
     hparams.device = int(args.device)
     hparams.sub_device = int(args.sub_device)
 
-    hparams.using_extra = True
+    # hparams.using_extra = True
+    # hparams.using_dropout = False
+    # hparams.using_LAP = True
+    hparams.using_extra = False
     hparams.using_dropout = False
-    hparams.using_LAP = True
+    hparams.using_LAP = False
     hparams.pmrl_tau_alignment = args.pmrl_tau_alignment
     hparams.pmrl_tau_regularization = 0.1
     hparams.pmrl_scale = args.pmrl_scale
     hparams.num_rephrase = args.num_rephrase
     hparams.using_imageembedding = args.using_imageembedding
 
+    # hparams.sequential_edit = True
+
 
 
     if args.ds == 'caption':
         train_ds = CaptionDataset(caption_train_path, config=hparams, size=100)
     elif args.ds == 'vqa':
-        train_ds = VQADataset(vqa_train_path, config=hparams, size=100)
+        # train_ds = VQADataset(vqa_train_path, config=hparams, size=100)
+        train_ds = VQADataset(vqa_train_path, config=hparams, size=50)
     else:
         raise ValueError(f"Unknown dataset type: {args.ds}")
     
@@ -146,23 +156,38 @@ def apply_wise_method(args):
         verbose=True
     )
     acc = 0
+    t_gen = 0
     gen = 0
     t_loc = 0
     i_loc = 0
+    # List to store gen values for each case
+    gen_values_list = []
     for case in metrics:
         acc += case["post"]["rewrite_acc"].item()
-        gen += case["post"]["image_rephrase_acc"].item()
+        t_gen += case["post"]["rephrase_acc"].item()
+        case_gen_value = case["post"]["image_rephrase_acc"].item()
+        gen += case_gen_value
+        gen_values_list.append(case_gen_value)  # Store individual gen value
         t_loc += case["post"]["locality_acc"].item()
         i_loc += case["post"]["multimodal_locality_acc"].item()
     
+    # Record gen values of each case to a txt file
+    gen_values_filename = f"gen_values_{args.method}_{args.model}_{args.ds}.txt"
+    gen_values_filepath = os.path.join(result_path, gen_values_filename)
+    os.makedirs(result_path, exist_ok=True)
+    with open(gen_values_filepath, 'w') as f:
+        for idx, gen_val in enumerate(gen_values_list):
+            f.write(f"Case {idx}: {gen_val}\n")
+    
     rewrite_acc = acc/len(metrics) * 100
+    t_gen_acc = t_gen/len(metrics) * 100
     rephrase_acc = gen/len(metrics) * 100
     text_loc_acc = t_loc/len(metrics) * 100
     image_loc_acc = i_loc/len(metrics) * 100
     
     # Print original console output
     print("-------------------- Final Results -------------------")
-    print(f"Rewrite Acc: {rewrite_acc}, Rephrase Acc: {rephrase_acc}, Text Loc Acc: {text_loc_acc}, Image Loc Acc: {image_loc_acc}")
+    print(f"Rewrite Acc: {rewrite_acc}, Text Gen Acc: {t_gen_acc}, Rephrase Acc: {rephrase_acc}, Text Loc Acc: {text_loc_acc}, Image Loc Acc: {image_loc_acc}")
     
     # Create single CSV log file path
     csv_filename = "results.csv"
@@ -172,7 +197,7 @@ def apply_wise_method(args):
     os.makedirs(result_path, exist_ok=True)  # Ensure directory exists
     file_exists = os.path.exists(csv_filepath)
     with open(csv_filepath, 'a', newline='') as csvfile:  # Using append mode to add to existing file
-        fieldnames = ['method', 'model', 'dataset', 'acc', 'gen', 't-loc', 'i-loc', 'PMRL_scale', 'PMRL_tau', 'num_rephrase', 'using_imageembedding']
+        fieldnames = ['method', 'model', 'dataset', 'acc','t-gen', 'i-gen', 't-loc', 'i-loc', 'PMRL_scale', 'PMRL_tau', 'num_rephrase', 'using_imageembedding']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
         # Write header only if file doesn't exist yet
@@ -185,7 +210,8 @@ def apply_wise_method(args):
             'model': args.model,
             'dataset': args.ds,
             'acc': rewrite_acc,
-            'gen': rephrase_acc,
+            't-gen': t_gen_acc,
+            'i-gen': rephrase_acc,
             't-loc': text_loc_acc,
             'i-loc': image_loc_acc,
             'PMRL_scale': args.pmrl_scale,

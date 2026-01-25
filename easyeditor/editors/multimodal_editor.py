@@ -14,6 +14,9 @@ import random
 import logging
 import numpy as np
 from PIL import Image
+import copy
+
+
 
 import transformers
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -423,126 +426,238 @@ class MultimodalEditor:
         
         all_metrics = []
 
-        for i, request in enumerate(tqdm(ds, desc='Editing dataset', total=len(ds))):
-
+        if self.hparams.sequential_edit:
+            sequential_num = getattr(self.hparams, 'sequential_num', 10)  # Get sequential_num from hparams, default to 1
+            pre_res = []
+            base_model = copy.copy(self.model)
+            
+            # Initialize variables to store final edited_model and weights_copy
+            edited_model = None
+            weights_copy = {}
+            
+            # Convert dataset to list for chunking
+            ds_list = list(ds)
             start = time()
             
-            if 'template' in kwargs:
-                request['prompt'] = kwargs['template'].format(request['prompt'])
+            # Process dataset in chunks
+            for chunk_idx, chunk in enumerate(self._chunks(ds_list, sequential_num)):
+                LOG.info(f"Processing chunk {chunk_idx + 1}/{(len(ds_list) + sequential_num - 1) // sequential_num}")
+                
+                # Compute pre-results for the current chunk
+                chunk_pre_res = []
+                for i, request in enumerate(chunk):
+                    if 'template' in kwargs:
+                        request['prompt'] = kwargs['template'].format(request['prompt'])
+                    
+                    if self.model_name in ['minigpt4', 'blip2']:
+                        chunk_pre_res.append(compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
+                                                        request, self.hparams.device))
+                    elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                        chunk_pre_res.append(compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
+                                                        request, self.hparams.device))
+                
+                # Apply edits to the current chunk
+                for i, request in enumerate(chunk):
+                    if 'template' in kwargs:
+                        request['prompt'] = kwargs['template'].format(request['prompt'])
+                    edited_model, weights_copy = self.apply_algo(
+                        self.model,
+                        self.tok,
+                        [request],
+                        self.hparams,
+                        copy=False,
+                        return_orig_weights=True,
+                        keep_original_weight=keep_original_weight
+                    )
 
-            if self.alg_name == 'IKE':
-                assert 'train_ds' in kwargs.keys() or print('IKE need train_ds (For getting In-Context prompt)')
-                edited_model, weights_copy, icl_examples = self.model, {}, self.apply_algo(
-                    self.model,
-                    self.tok,
-                    request,
-                    self.hparams,
-                    copy=False,
-                    return_orig_weights=True,
-                    keep_original_weight=keep_original_weight,
-                    train_ds=kwargs['train_ds']
-                )
-            else:
-                # fixbug：COPY=False时，此处执行apply_algo前后self.model被修改，但Pre计算会引入wiseadapter的计算
-                # 这会导致acc, gen在pre中就已经是1了，并不符合实际（实际由于随机性，会有一定的正确率，但不会是1）
-                # 这也意味着当前方法其实是在sequential_edit场景下实现的single_edit评测，逻辑似乎有问题
-                # 最好的解决方式是：将WISE初始化中【替换编辑层】的操作加一个if判断是single还是sequential需求
-                # 这样既不占用额外显存，也没有逻辑上的漏洞
-                if self.model_name in ['minigpt4', 'blip2']:
-                    pre_res = compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
-                                                            request, self.hparams.device)
-                elif self.model_name in ['llava-onevision', 'qwen2-vl']:
-                    pre_res = compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
-                                                            request, self.hparams.device)
-                edited_model, weights_copy = self.apply_algo(
-                    self.model,
-                    self.tok,
-                    [request],
-                    self.hparams,
-                    copy=False,
-                    return_orig_weights=True,
-                    keep_original_weight=keep_original_weight
-                )
-            exec_time = time() - start
-            LOG.info(f"Execution {i} editing took {exec_time}")
-            start = time()
-            if self.alg_name == 'IKE':
-                metrics = {
-                    'case_id': i,
-                    # "requested_rewrite": request,
-                    "time": exec_time,
-                    "post": compute_icl_multimodal_edit_quality(self.model, self.model_name, self.hparams, self.tok, icl_examples,
-                                                        request, self.hparams.device),
-                    "pre": compute_icl_multimodal_edit_quality(self.model, self.model_name, self.hparams, self.tok, [''],
-                                                        request, self.hparams.device, pre_edit=True)
-                }
-            else:
-                if self.model_name in ['minigpt4', 'blip2']:
-                    metrics = {
-                        'case_id': i,
-                        "time": exec_time,
-                        "post": compute_multimodal_edit_results(edited_model, self.model_name, self.hparams, self.tok,
-                                                            request, self.hparams.device),
-                        "pre": pre_res
-                    }
-                elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                # Evaluate results for the current chunk
+                for i, request in enumerate(chunk):
+                    global_i = chunk_idx * sequential_num + i  # Calculate global index
+                    
+                    if self.model_name in ['minigpt4', 'blip2']:
+                        metrics = {
+                            'case_id': global_i,
+                            "post": compute_multimodal_edit_results(edited_model, self.model_name, self.hparams, self.tok,
+                                                                request, self.hparams.device),
+                            "pre": chunk_pre_res[i]  # Use chunk-specific pre result
+                        }
+                    elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                        metrics = {
+                            'case_id': global_i,
+                            "post": compute_multimodal_hf_edit_results(edited_model, self.model_name, self.hparams, self.tok,
+                                                                request, self.hparams.device),
+                            "pre": chunk_pre_res[i]  # Use chunk-specific pre result
+                        }
+                    if 'locality_output' in metrics['post'].keys():
+                        assert len(metrics['post']['locality_output']) == \
+                                len(metrics['pre']['locality_output'])
+                        base_logits = metrics['pre']['locality_output'].to(torch.float32)
+                        post_logits = metrics['post']['locality_output'].to(torch.float32)
+                        if post_logits.shape[1] > base_logits.shape[1]:
+                            post_logits = post_logits[:, -base_logits.shape[1]:, :]
+                        else:
+                            base_logits = base_logits[:, -post_logits.shape[1]:, :]
+
+                        base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(base_logits, dim=-1), k=1, dim=-1).indices
+                        post_base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(post_logits, dim=-1), k=1, dim=-1).indices
+                        metrics['post']['locality_acc'] = sum(post_base_logits_softmax_top_k.view(-1) == base_logits_softmax_top_k.view(-1))/post_base_logits_softmax_top_k.view(-1).shape[0]
+                        metrics['post'].pop('locality_output')
+                        metrics['pre'].pop('locality_output')
+                        
+                    if 'multimodal_locality_output' in metrics['post'].keys():
+                        assert len(metrics['post']['multimodal_locality_output']) == \
+                                len(metrics['pre']['multimodal_locality_output'])
+                        base_image_logits = metrics['pre']['multimodal_locality_output'].to(torch.float32)
+                        post_image_logits = metrics['post']['multimodal_locality_output'].to(torch.float32)
+                        if post_image_logits.shape[1] > base_image_logits.shape[1]:
+                            post_image_logits = post_image_logits[:, -base_image_logits.shape[1]:, :]
+                        else:
+                            base_image_logits = base_image_logits[:, -post_image_logits.shape[1]:, :]
+
+                        base_image_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(base_image_logits, dim=-1), k=10, dim=-1).indices
+                        post_image_base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(post_image_logits, dim=-1), k=10, dim=-1).indices
+                        metrics['post']['multimodal_locality_acc'] = sum(post_image_base_logits_softmax_top_k.view(-1) == base_image_logits_softmax_top_k.view(-1))/post_image_base_logits_softmax_top_k.view(-1).shape[0]
+                        metrics['post'].pop('multimodal_locality_output')
+                        metrics['pre'].pop('multimodal_locality_output')
+
+                    LOG.info(f"Evaluation took {time() - start}")
+
+                    if verbose:
+                        LOG.info(
+                            f"{global_i} editing: {request['prompt']} -> {request['target']}  \n {metrics}"
+                        )
+
+                        all_metrics.append(metrics)
+                
+                # Reset model to base_model after processing the chunk (except for the last chunk)
+                # We need to restore the model to its original state
+                # For proper restoration, we might need to restore the weights properly
+                # This depends on how the apply_algo function modifies the model
+                # For now, we'll restore from base_model after each chunk except the last one
+                total_chunks = (len(ds_list) + sequential_num - 1) // sequential_num  # Ceiling division
+                if chunk_idx < total_chunks - 1:  # Don't reset after the last chunk
+                    self.model = copy.copy(base_model)
+        else:
+            for i, request in enumerate(tqdm(ds, desc='Editing dataset', total=len(ds))):
+
+                start = time()
+                
+                if 'template' in kwargs:
+                    request['prompt'] = kwargs['template'].format(request['prompt'])
+
+                if self.alg_name == 'IKE':
+                    assert 'train_ds' in kwargs.keys() or print('IKE need train_ds (For getting In-Context prompt)')
+                    edited_model, weights_copy, icl_examples = self.model, {}, self.apply_algo(
+                        self.model,
+                        self.tok,
+                        request,
+                        self.hparams,
+                        copy=False,
+                        return_orig_weights=True,
+                        keep_original_weight=keep_original_weight,
+                        train_ds=kwargs['train_ds']
+                    )
+                else:
+                    # fixbug：COPY=False时，此处执行apply_algo前后self.model被修改，但Pre计算会引入wiseadapter的计算
+                    # 这会导致acc, gen在pre中就已经是1了，并不符合实际（实际由于随机性，会有一定的正确率，但不会是1）
+                    # 这也意味着当前方法其实是在sequential_edit场景下实现的single_edit评测，逻辑似乎有问题
+                    # 最好的解决方式是：将WISE初始化中【替换编辑层】的操作加一个if判断是single还是sequential需求
+                    # 这样既不占用额外显存，也没有逻辑上的漏洞
+                    if self.model_name in ['minigpt4', 'blip2']:
+                        pre_res = compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
+                                                                request, self.hparams.device)
+                    elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                        pre_res = compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
+                                                                request, self.hparams.device)
+                    edited_model, weights_copy = self.apply_algo(
+                        self.model,
+                        self.tok,
+                        [request],
+                        self.hparams,
+                        copy=False,
+                        return_orig_weights=True,
+                        keep_original_weight=keep_original_weight
+                    )
+                exec_time = time() - start
+                LOG.info(f"Execution {i} editing took {exec_time}")
+                start = time()
+                if self.alg_name == 'IKE':
                     metrics = {
                         'case_id': i,
                         # "requested_rewrite": request,
                         "time": exec_time,
-                        "post": compute_multimodal_hf_edit_results(edited_model, self.model_name, self.hparams, self.tok,
+                        "post": compute_icl_multimodal_edit_quality(self.model, self.model_name, self.hparams, self.tok, icl_examples,
                                                             request, self.hparams.device),
-                        "pre": pre_res
-                    }   
-                # metrics = {
-                #     'case_id': i,
-                #     # "requested_rewrite": request,
-                #     "time": exec_time,
-                #     "post": compute_multimodal_edit_results(edited_model, self.model_name, self.hparams, self.tok,
-                #                                         request, self.hparams.device),
-                #     "pre": compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
-                #                                         request, self.hparams.device)
-                # }
-            if 'locality_output' in metrics['post'].keys():
-                assert len(metrics['post']['locality_output']) == \
-                        len(metrics['pre']['locality_output'])
-                base_logits = metrics['pre']['locality_output'].to(torch.float32)
-                post_logits = metrics['post']['locality_output'].to(torch.float32)
-                if post_logits.shape[1] > base_logits.shape[1]:
-                    post_logits = post_logits[:, -base_logits.shape[1]:, :]
+                        "pre": compute_icl_multimodal_edit_quality(self.model, self.model_name, self.hparams, self.tok, [''],
+                                                            request, self.hparams.device, pre_edit=True)
+                    }
                 else:
-                    base_logits = base_logits[:, -post_logits.shape[1]:, :]
+                    if self.model_name in ['minigpt4', 'blip2']:
+                        metrics = {
+                            'case_id': i,
+                            "time": exec_time,
+                            "post": compute_multimodal_edit_results(edited_model, self.model_name, self.hparams, self.tok,
+                                                                request, self.hparams.device),
+                            "pre": pre_res
+                        }
+                    elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                        metrics = {
+                            'case_id': i,
+                            # "requested_rewrite": request,
+                            "time": exec_time,
+                            "post": compute_multimodal_hf_edit_results(edited_model, self.model_name, self.hparams, self.tok,
+                                                                request, self.hparams.device),
+                            "pre": pre_res
+                        }   
+                    # metrics = {
+                    #     'case_id': i,
+                    #     # "requested_rewrite": request,
+                    #     "time": exec_time,
+                    #     "post": compute_multimodal_edit_results(edited_model, self.model_name, self.hparams, self.tok,
+                    #                                         request, self.hparams.device),
+                    #     "pre": compute_multimodal_edit_results(self.model, self.model_name, self.hparams, self.tok,
+                    #                                         request, self.hparams.device)
+                    # }
+                if 'locality_output' in metrics['post'].keys():
+                    assert len(metrics['post']['locality_output']) == \
+                            len(metrics['pre']['locality_output'])
+                    base_logits = metrics['pre']['locality_output'].to(torch.float32)
+                    post_logits = metrics['post']['locality_output'].to(torch.float32)
+                    if post_logits.shape[1] > base_logits.shape[1]:
+                        post_logits = post_logits[:, -base_logits.shape[1]:, :]
+                    else:
+                        base_logits = base_logits[:, -post_logits.shape[1]:, :]
 
-                base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(base_logits, dim=-1), k=1, dim=-1).indices
-                post_base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(post_logits, dim=-1), k=1, dim=-1).indices
-                metrics['post']['locality_acc'] = sum(post_base_logits_softmax_top_k.view(-1) == base_logits_softmax_top_k.view(-1))/post_base_logits_softmax_top_k.view(-1).shape[0]
-                metrics['post'].pop('locality_output')
-                metrics['pre'].pop('locality_output')
-                
-            if 'multimodal_locality_output' in metrics['post'].keys():
-                assert len(metrics['post']['multimodal_locality_output']) == \
-                        len(metrics['pre']['multimodal_locality_output'])
-                base_image_logits = metrics['pre']['multimodal_locality_output'].to(torch.float32)
-                post_image_logits = metrics['post']['multimodal_locality_output'].to(torch.float32)
-                if post_image_logits.shape[1] > base_image_logits.shape[1]:
-                    post_image_logits = post_image_logits[:, -base_image_logits.shape[1]:, :]
-                else:
-                    base_image_logits = base_image_logits[:, -post_image_logits.shape[1]:, :]
+                    base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(base_logits, dim=-1), k=1, dim=-1).indices
+                    post_base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(post_logits, dim=-1), k=1, dim=-1).indices
+                    metrics['post']['locality_acc'] = sum(post_base_logits_softmax_top_k.view(-1) == base_logits_softmax_top_k.view(-1))/post_base_logits_softmax_top_k.view(-1).shape[0]
+                    metrics['post'].pop('locality_output')
+                    metrics['pre'].pop('locality_output')
+                    
+                if 'multimodal_locality_output' in metrics['post'].keys():
+                    assert len(metrics['post']['multimodal_locality_output']) == \
+                            len(metrics['pre']['multimodal_locality_output'])
+                    base_image_logits = metrics['pre']['multimodal_locality_output'].to(torch.float32)
+                    post_image_logits = metrics['post']['multimodal_locality_output'].to(torch.float32)
+                    if post_image_logits.shape[1] > base_image_logits.shape[1]:
+                        post_image_logits = post_image_logits[:, -base_image_logits.shape[1]:, :]
+                    else:
+                        base_image_logits = base_image_logits[:, -post_image_logits.shape[1]:, :]
 
-                base_image_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(base_image_logits, dim=-1), k=10, dim=-1).indices
-                post_image_base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(post_image_logits, dim=-1), k=10, dim=-1).indices
-                metrics['post']['multimodal_locality_acc'] = sum(post_image_base_logits_softmax_top_k.view(-1) == base_image_logits_softmax_top_k.view(-1))/post_image_base_logits_softmax_top_k.view(-1).shape[0]
-                metrics['post'].pop('multimodal_locality_output')
-                metrics['pre'].pop('multimodal_locality_output')
+                    base_image_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(base_image_logits, dim=-1), k=10, dim=-1).indices
+                    post_image_base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(post_image_logits, dim=-1), k=10, dim=-1).indices
+                    metrics['post']['multimodal_locality_acc'] = sum(post_image_base_logits_softmax_top_k.view(-1) == base_image_logits_softmax_top_k.view(-1))/post_image_base_logits_softmax_top_k.view(-1).shape[0]
+                    metrics['post'].pop('multimodal_locality_output')
+                    metrics['pre'].pop('multimodal_locality_output')
 
-            LOG.info(f"Evaluation took {time() - start}")
+                LOG.info(f"Evaluation took {time() - start}")
 
-            if verbose:
-                LOG.info(
-                    f"{i} editing: {request['prompt']} -> {request['target']}  \n {metrics}"
-                )
+                if verbose:
+                    LOG.info(
+                        f"{i} editing: {request['prompt']} -> {request['target']}  \n {metrics}"
+                    )
 
-                all_metrics.append(metrics)
+                    all_metrics.append(metrics)
 
         return all_metrics, edited_model, weights_copy
 

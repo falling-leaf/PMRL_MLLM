@@ -315,6 +315,7 @@ def compute_multimodal_hf_edit_quality_demo(model, batch, tok, exach_match=False
 def compute_multimodal_edit_quality(model, batch, exact_match=False):
     with torch.no_grad():
         outputs = model(batch)
+        # print(model.generate(batch))
         if isinstance(outputs, torch.Tensor):
             logits = outputs.detach().cpu()
             targ = batch["labels"].cpu()
