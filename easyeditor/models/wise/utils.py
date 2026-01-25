@@ -32,7 +32,6 @@ def print_trainable_parameters(model, new_weight, mask_ratio):
 def parent_module(model, pname):
     components = pname.split('.')
     parent = model
-
     for component in components[:-1]:
         if hasattr(parent, component):
             parent = getattr(parent, component)
