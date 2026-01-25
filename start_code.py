@@ -124,13 +124,14 @@ def apply_wise_method(args):
     # 设置设备
     hparams.device = int(args.device)
     hparams.sub_device = int(args.sub_device)
-
-    # hparams.using_extra = True
-    # hparams.using_dropout = False
-    # hparams.using_LAP = True
-    hparams.using_extra = False
-    hparams.using_dropout = False
-    hparams.using_LAP = False
+    if args.using_extra:
+        hparams.using_extra = True
+        hparams.using_dropout = False
+        hparams.using_LAP = True
+    else:
+        hparams.using_extra = False
+        hparams.using_dropout = False
+        hparams.using_LAP = False
     hparams.pmrl_tau_alignment = args.pmrl_tau_alignment
     hparams.pmrl_tau_regularization = 0.1
     hparams.pmrl_scale = args.pmrl_scale
@@ -256,6 +257,9 @@ def main():
 
     parser.add_argument('--using_imageembedding', action='store_true',
                        help='Use image embedding (default: False)')
+
+    parser.add_argument('--using_extra', action='store_true',
+                       help='Use extra (default: False)')
     
     # 解析参数
     args = parser.parse_args()
