@@ -12,6 +12,7 @@ scripts
 vectors
 **/.cache/
 *.log
+*.status
 delta.txt
 .history
 **/.hydra/
