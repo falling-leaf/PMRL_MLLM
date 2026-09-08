@@ -66,7 +66,7 @@ class CaptionDataset(BaseDataset):
 
         self.config = config
         self.tok = tokenizer
-        self.max_length = 32
+        self.max_length = 16
 
         self.prompt = "Question: {} Short answer:"
 
@@ -74,10 +74,6 @@ class CaptionDataset(BaseDataset):
         if size is not None:
             self.annotation = self.annotation[:size]  
         for i, record in enumerate(self.annotation):
-            if i < 39:
-                continue
-            if i == 40:
-                break
             if record['alt'] == "":
                 continue
             

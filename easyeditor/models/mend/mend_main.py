@@ -152,6 +152,38 @@ class MendMultimodalRewriteExecutor(MendRewriteExecutor):
     def __init__(self):
         super().__init__()
 
+    @staticmethod
+    def _singleton_request(request):
+        """MultimodalEditor supplies singleton edits as ``[request]``."""
+        if isinstance(request, list):
+            if len(request) != 1:
+                raise ValueError("MEND multimodal execution requires one request")
+            return request[0]
+        return request
+
+    @staticmethod
+    def _qwen2vl_edit_batch(request, processor, device):
+        """Build the masked HF batch used by Qwen2-VL MEND."""
+        target = (" " if request["target"][0] != " " else "") + request["target"]
+        chat = processor.apply_chat_template(
+            [{"role": "user", "content": [
+                {"type": "image"}, {"type": "text", "text": request["prompt"]}
+            ]}], add_generation_prompt=True, tokenize=False,
+        )
+        if "|vision_start|" not in chat:
+            chat = "<|vision_start|><|image_pad|><|vision_end|>" + chat
+        batch = processor(text=[chat + target], images=[request["image"]],
+                          return_tensors="pt", padding=True)
+        target_ids = processor.tokenizer([target], add_special_tokens=False,
+                                         return_tensors="pt", padding=True)["input_ids"]
+        labels = torch.full_like(batch["input_ids"], -100)
+        labels[:, -target_ids.size(1):] = target_ids
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                batch[key] = value.to(device)
+        batch["labels"] = labels.to(device)
+        return batch
+
     def init_model(self, model, tok, params: MENDMultimodalHparams):
 
         assert params.archive is not None or print(f'Training weights Needed....')
@@ -169,7 +201,7 @@ class MendMultimodalRewriteExecutor(MendRewriteExecutor):
 
         # Load the trained MEND model
         self.alg = MEND(self.model, params, lambda: deepcopy(self.model))
-        d = torch.load(params.archive)
+        d = torch.load(params.archive, map_location='cpu', weights_only=False)
 
         self.alg.load_state_dict(
             {k.replace("gtn.", "mend."): v for k, v in d["model"].items()}
@@ -204,11 +236,26 @@ class MendMultimodalRewriteExecutor(MendRewriteExecutor):
         how mend will change the weights of the model.
         """
 
+        request = self._singleton_request(request)
         if not self.is_init:
             self.init_model(model, tok, hparams)
 
         weights_copy = {}
         model = deepcopy(self.model) if copy else self.model
+
+        if "qwen2-vl" in hparams.model_name.lower():
+            edit_inner = self._qwen2vl_edit_batch(request, tok, model.device)
+            self.alg.eval()
+            edited_model, _ = self.alg.edit(edit_inner, return_factors=False)
+            with torch.no_grad():
+                for name, parameter in model.named_parameters():
+                    if name in hparams.inner_params:
+                        if return_orig_weights:
+                            weights_copy[name] = parameter.detach().clone()
+                        parameter.copy_(edited_model.model.state_dict()[name])
+            if not keep_original_weight:
+                weights_copy = {}
+            return model, weights_copy
 
         # Define i/o
         src = [request["prompt"]]

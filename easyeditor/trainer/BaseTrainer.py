@@ -26,11 +26,19 @@ from .utils import (
 LOG = logging.getLogger(__name__)
 
 
+def _main_optimizer_parameters(model):
+    """Exclude edit_lrs when they are managed by MultimodalTrainer.lr_opt."""
+    edit_lrs = getattr(model, "edit_lrs", None)
+    for parameter in model.outer_parameters():
+        if parameter is not edit_lrs:
+            yield parameter
+
+
 class BaseTrainer:
     def __init__(self, config, train_set: Dataset, val_set: Dataset):
         LOG.info(f'Config: {config}')
         model_ = get_model(config)
-        if 'qwen2' in config.model_name.lower():
+        if 'qwen2' in config.model_name.lower() or 'llava-onevision' in config.model_name.lower():
             model_.bfloat16()
         self.alg_module = ALG_TRAIN_DICT[config.alg.upper()]
         LOG.info(f"Loading class {config.alg.upper()} from module {self.alg_module}")
@@ -84,7 +92,7 @@ class BaseTrainer:
         if not self.config.eval_only and self.config.alg!='MALMEN':
             self.OptimizerClass = getattr(torch.optim, config.opt)
             LOG.info(f"Building optimizer {self.OptimizerClass} with lr {config.lr}")
-            self.opt = self.OptimizerClass(self.model.outer_parameters(), lr=config.lr)
+            self.opt = self.OptimizerClass(_main_optimizer_parameters(self.model), lr=config.lr)
 
         if config.archive is not None:
             archive, config.archive = load_archive(str(config.archive))
@@ -137,6 +145,24 @@ class BaseTrainer:
 
         torch.save(obj, self.save_path)
         LOG.info("Write complete.")
+
+    def save_prevalidation_state(self):
+        """Persist a recoverable MEND state before memory-heavy validation."""
+        if (self.config.debug and not self.config.save) or self.config.eval_only:
+            return
+        obj = {
+            "model": self.model.state_dict(),
+            "opt": self.opt.state_dict() if self.config.alg != 'MALMEN' else self.model.opt.state_dict(),
+            "lr_opt": self.lr_opt.state_dict() if self.lr_opt is not None else None,
+            "val_stats": None,
+            "start_time": self.start_time,
+            "elapsed_time": time_delta_seconds(self.start_time),
+            "step": self.global_iter,
+        }
+        path = f"{self.save_path}.prevalidation"
+        LOG.info(f"Saving pre-validation model to {path}")
+        torch.save(obj, path)
+        LOG.info("Pre-validation write complete.")
 
     def echo(self, train_step, info_dict, pretty=False):
         if not self.config.silent:
@@ -202,6 +228,8 @@ class BaseTrainer:
                         averager.reset()
                         self.echo(self.global_iter, avg_info)
                 if self.global_iter % self.config.val_interval == 0:
+                    if getattr(self.config, "checkpoint_before_validation", False):
+                        self.save_prevalidation_state()
                     if self.config.alg == 'MALMEN':
                         val_info = self.model.valid(config=self.config, loader=self.val_loader, val_set=self.val_set, steps=self.config.val_steps)
                     else:
@@ -231,7 +259,7 @@ class BaseTrainer:
                     )
                     self.model.load_state_dict(archive["model"])
                 else:
-                    archive = torch.load(self.save_path, map_location="cpu")
+                    archive = torch.load(self.save_path, map_location="cpu", weights_only=False)
                     LOG.info(
                         f"Loading best model from step {archive['step']}, elapsed time {archive['elapsed_time']}"
                     )

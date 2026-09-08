@@ -290,38 +290,35 @@ def multimodal_tokenize(batch, processor, device, context_templates=None, hparam
             else:
                 num_images = 1
             if "qwen2-vl" in hparams.model_name.lower():
-                image_token = "<|vision_start|><|image_pad|><|vision_end|>"
-                temp_prompt = [image_token + p + " " + l for p, l in zip(prompts, labels)]
-                # 事实上此处prompt_ids仅作为计算答案长度用
-                prompt_ids = processor.tokenizer([image_token + p for p in prompts], return_tensors="pt", padding=True, truncation=True)["input_ids"]
-                # print("temp_prompt: ", temp_prompt)
-                # print("prompt_ids", prompt_ids)
+                edit_prompts = [processor.apply_chat_template(
+                    [{
+                        "role": "user",
+                        "content": [{"type": "image"}] * num_images
+                        + [{"type": "text", "text": p}],
+                    }],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                ) for p in prompts]
+                temp_prompt = [prompt + l for prompt, l in zip(edit_prompts, labels)]
+                prompt_ids = processor.tokenizer(
+                    edit_prompts, return_tensors="pt", padding=True, truncation=True
+                )["input_ids"]
 
 
             else:
-                temp_prompt = [processor.apply_chat_template([
-                                        {
-
-                                            "role": "user",
-                                            "content": [{"type": "image"}] * num_images + [{"type": "text", "text": p}],
-                                        },
-                                    ],
-                                                    add_generation_prompt=True,
-                                                    tokenize=False)  + l
-                                for p, l in zip(prompts, labels)]
-                
+                edit_prompts = [processor.apply_chat_template(
+                    [{
+                        "role": "user",
+                        "content": [{"type": "image"}] * num_images
+                        + [{"type": "text", "text": p}],
+                    }],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                ) for p in prompts]
+                temp_prompt = [prompt + l for prompt, l in zip(edit_prompts, labels)]
                 prompt_ids = processor.tokenizer(
-                [processor.apply_chat_template([
-                                {
-
-                                    "role": "user",
-                                    "content": [
-                                        [{"type": "image"}] * num_images + [{"type": "text", "text": p}]
-                                        ],
-                                },
-                            ],
-                                        add_generation_prompt=True,
-                                        tokenize=False) for p in prompts], return_tensors="pt", padding=True, truncation=True)["input_ids"]
+                    edit_prompts, return_tensors="pt", padding=True, truncation=True
+                )["input_ids"]
             print("prompt with template: ", temp_prompt)     
         else:
             raise AssertionError("Not support file type: {}".format(file_type))
@@ -387,9 +384,41 @@ def multimodal_tokenize(batch, processor, device, context_templates=None, hparam
     tokens = {key: val.to(device) for key, val in tokens.items()}
 
     if file_type in ["image", "single-image", "multi-image"]:
-        multimodal_inputs = processor(images=input_images, text=full_prompt, return_tensors="pt", padding=True).to(device, dtype=hparams.dtype)
+        edit_inputs = processor(
+            images=input_images, text=temp_prompt, return_tensors="pt", padding=True
+        ).to(device, dtype=hparams.dtype)
+        locality_inputs = processor(
+            text=chat_loc_prompts, return_tensors="pt", padding=True
+        ).to(device, dtype=hparams.dtype)
+        multimodal_inputs = [edit_inputs, locality_inputs]
     elif file_type == "video":
         multimodal_inputs = processor(videos=input_images[0], text=full_prompt, return_tensors="pt", padding=True).to(device, dtype=hparams.dtype)
+
+    # Build target-only labels against each final processor result. Qwen2-VL
+    # expands image placeholders, so text-only labels are not sequence-aligned.
+    def _install_target_labels(inputs, targets):
+        hf_labels = torch.full_like(inputs["input_ids"], mask_token)
+        target_ids = processor.tokenizer(
+            targets, add_special_tokens=False, return_tensors="pt", padding=True
+        )["input_ids"].to(device)
+        pad_id = processor.tokenizer.pad_token_id
+        for row_idx in range(len(targets)):
+            target_len = (
+                target_ids.size(1)
+                if pad_id is None
+                else int(target_ids[row_idx].ne(pad_id).sum())
+            )
+            if target_len:
+                hf_labels[row_idx, -target_len:] = target_ids[row_idx, :target_len]
+        if not hf_labels.ne(mask_token).any():
+            raise RuntimeError("HF multimodal batch contains no supervised target tokens")
+        inputs["labels"] = hf_labels
+
+    if isinstance(multimodal_inputs, list):
+        _install_target_labels(multimodal_inputs[0], labels)
+        _install_target_labels(multimodal_inputs[1], loc_prompts_labels)
+    else:
+        _install_target_labels(multimodal_inputs, labels)
         
     last_prompt_token_loc = (tokens["labels"] == -100).sum(dim=-1)[0]
     last_ans_token_loc = (tokens["labels"] == processor.tokenizer.pad_token_id).sum(dim=-1)[0]

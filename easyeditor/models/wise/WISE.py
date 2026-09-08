@@ -136,7 +136,7 @@ class WISE(torch.nn.Module):
 
     # TODO: generation
     def generate(self, *args, **kwargs):
-        setattr(eval(f"self.model.{self.layer}"), "key_id", -1)
+        setattr(self.get_adapter_layer(), "key_id", -1)
         return self.model.generate(*args, **kwargs)
 
     def edit(self, config, tokens, act_mask=None, deact_mask=None):
@@ -147,10 +147,10 @@ class WISE(torch.nn.Module):
         # for retrieve ##
         last_prompt_token_loc = (tokens["labels"] == -100).sum(dim=-1) - 1
 
-        setattr(eval(f"self.model.{self.layer}"), "training", True)
-        setattr(eval(f"self.model.{self.layer}"), "editing", True)
+        setattr(self.get_adapter_layer(), "training", True)
+        setattr(self.get_adapter_layer(), "editing", True)
         self.get_adapter_layer().set_parameter_tunable()
-        if getattr(eval(f"self.model.{self.layer}"), "editing_total_cnt") % self.config.save_freq == 0:
+        if getattr(self.get_adapter_layer(), "editing_total_cnt") % self.config.save_freq == 0:
             self.get_adapter_layer().generate_activation_mask(self.config.mask_ratio)
 
         # --- train Wise value ---
@@ -231,11 +231,11 @@ class WISE(torch.nn.Module):
                 self._norm_constraint(self.config.norm_constraint)
 
         # --- pull out info we want to log from the Wise layer ---
-        setattr(eval(f"self.model.{self.layer}"), "editing", False)
-        setattr(eval(f"self.model.{self.layer}"), "training", False)
+        setattr(self.get_adapter_layer(), "editing", False)
+        setattr(self.get_adapter_layer(), "training", False)
 
-        editing_total_cnt = getattr(eval(f"self.model.{self.layer}"), "editing_total_cnt") + 1
-        setattr(eval(f"self.model.{self.layer}"), "editing_total_cnt", editing_total_cnt)
+        editing_total_cnt = getattr(self.get_adapter_layer(), "editing_total_cnt") + 1
+        setattr(self.get_adapter_layer(), "editing_total_cnt", editing_total_cnt)
         #
         if self.config.save_freq is not None and editing_total_cnt % self.config.save_freq == 0:
             self.get_adapter_layer().save_weight()
@@ -281,18 +281,30 @@ class WISE(torch.nn.Module):
 
     def _cal_activation_loss(self, original_layer_output, new_weight_layer_output, config=None, act_mask=None,
                               deact_mask=None):
+        if config is None:
+            config = self.config
         if hasattr(self.model.config, 'batch_size'):
             k = self.config.batch_size
         else:
             k = 1
         total_loss = []
-        # print("Input dim:", self.get_adapter_layer().weight.shape[1])
-        # print("Output dim:", self.get_adapter_layer().weight.shape[0])
-        # print("original_layer_output_shape: ", original_layer_output.shape)
-        # print("new_weight_layer_output: ", new_weight_layer_output.shape)
-        if self.config.model_name == "blip2":
-            original_layer_output = original_layer_output.reshape(2, -1, original_layer_output.size(-1))
-            new_weight_layer_output = new_weight_layer_output.reshape(2, -1, new_weight_layer_output.size(-1))
+        if hasattr(self.get_adapter_layer(), "wise_edit_activation_count"):
+            split = getattr(
+                self.get_adapter_layer(),
+                "wise_edit_activation_count",
+                original_layer_output.shape[0] // 2,
+            )
+            in_scope_dist = euc(
+                original_layer_output[:split], new_weight_layer_output[:split], config
+            ).mean()
+            out_scope_dist = euc(
+                original_layer_output[split:], new_weight_layer_output[split:], config
+            ).mean()
+            return (
+                torch.clamp(out_scope_dist - in_scope_dist + config.gamma, min=0)
+                + torch.clamp(out_scope_dist - config.alpha, min=0)
+                + torch.clamp(config.beta - in_scope_dist, min=0)
+            )
         len_temp = original_layer_output.shape[0] / k - 1
         for i,act_mk in enumerate(act_mask):
             if act_mk is not None:
@@ -474,7 +486,14 @@ class WISEAdapter(torch.nn.Module):
             self.new_weight = copy.deepcopy(self.original_layer.weight)
 
     def save_editing_activation(self):
-        in_scope_dist = euc(self.original_layer_output[:-1, ...], self.new_weight_layer_output[:-1, ...], self.config)
+        split = getattr(self, "wise_edit_activation_count", None)
+        if split is None:
+            in_scope_original = self.original_layer_output[:-1, ...]
+            in_scope_new = self.new_weight_layer_output[:-1, ...]
+        else:
+            in_scope_original = self.original_layer_output[:split, ...]
+            in_scope_new = self.new_weight_layer_output[:split, ...]
+        in_scope_dist = euc(in_scope_original, in_scope_new, self.config)
         self.editing_mean_act.update(in_scope_dist.mean().item())
 
     def generate_activation_mask(self, mask_ratio):
@@ -560,10 +579,10 @@ class WISEMultimodal(WISE):
         edit_history.append([{f"{k1}" : v1.to('cpu') for k1, v1 in text_tokens.items()}, False])
         last_prompt_token_loc = (text_tokens["labels"] == -100).sum(dim=-1) - 1
         
-        setattr(eval(f"self.model.{self.layer}"), "training", True)
-        setattr(eval(f"self.model.{self.layer}"), "editing", True)
+        setattr(self.get_adapter_layer(), "training", True)
+        setattr(self.get_adapter_layer(), "editing", True)
         self.get_adapter_layer().set_parameter_tunable()
-        if getattr(eval(f"self.model.{self.layer}"), "editing_total_cnt") % self.config.save_freq == 0:
+        if getattr(self.get_adapter_layer(), "editing_total_cnt") % self.config.save_freq == 0:
             self.get_adapter_layer().generate_activation_mask(self.config.mask_ratio)        
         
         # --- train Wise value ---
@@ -646,7 +665,7 @@ class WISEMultimodal(WISE):
             if type(self.config.norm_constraint) is float:
                 super()._norm_constraint(self.config.norm_constraint)
 
-            if i == 9:
+            if i == 9 and getattr(self.config, "export_lap_samples", False):
                 # 0. 获取生成数量，默认为1
                 num_rephrase = 10
                 rephrase_samples = []
@@ -743,11 +762,11 @@ class WISEMultimodal(WISE):
                         print(f"Rephrase sample {idx} saved to {file_path}")
 
         # --- pull out info we want to log from the Wise layer ---
-        setattr(eval(f"self.model.{self.layer}"), "editing", False)
-        setattr(eval(f"self.model.{self.layer}"), "training", False)
+        setattr(self.get_adapter_layer(), "editing", False)
+        setattr(self.get_adapter_layer(), "training", False)
 
-        editing_total_cnt = getattr(eval(f"self.model.{self.layer}"), "editing_total_cnt") + 1
-        setattr(eval(f"self.model.{self.layer}"), "editing_total_cnt", editing_total_cnt)
+        editing_total_cnt = getattr(self.get_adapter_layer(), "editing_total_cnt") + 1
+        setattr(self.get_adapter_layer(), "editing_total_cnt", editing_total_cnt)
         if self.config.save_freq is not None and editing_total_cnt % self.config.save_freq == 0:
             super().get_adapter_layer().save_weight()
             print(f'Add New Weight to Memory...')
@@ -762,60 +781,84 @@ class WISEMultimodal(WISE):
 
     def pmrl_loss(
             self,
-            embeddings_list, 
-            tau_alignment=0.05, 
-            tau_regularization=0.1, 
-            lambda_reg=1.0
+            embeddings_list,
+            tau_alignment=0.05,
+            tau_regularization=0.1,
+            alignment_weight=1.0,
+            regularization_weight=0.1,
+            spectral_alignment=False,
+            return_components=False,
         ):
-        if not isinstance(embeddings_list, list):
-            raise ValueError("pmrl_loss expects a list of tensors.")
-            
-        # 1. 堆叠
-        Z = torch.stack(embeddings_list, dim=2) 
-        
-        # =======================================================
-        # 【关键修复】: 强制转换为 float32 以避免 SVD 崩溃
-        # =======================================================
-        original_dtype = Z.dtype
-        Z = Z.to(torch.float32)
+        """View consistency plus weighted anti-collapse regularization.
 
-        # 2. 模态内标准化 (Normalization)
-        # 增加 eps 防止除以零 (虽然 F.normalize 默认有 eps，但手动指定更稳)
-        Z = F.normalize(Z, p=2, dim=1, eps=1e-6)
-        
-        # 3. SVD
-        # 此时 Z 是 float32，SVD 会非常稳定
-        try:
-            U, S, Vh = torch.linalg.svd(Z, full_matrices=False)
-        except RuntimeError as e:
-            # 即使在 float32 下，如果输入全是 NaN 也会挂，这里做个兜底
-            print(f"SVD failed with error: {e}")
-            # 打印一下 Z 的统计信息帮助 debug
-            print(f"Z stats - Max: {Z.max()}, Min: {Z.min()}, IsNaN: {torch.isnan(Z).any()}")
-            return torch.tensor(0.0, device=Z.device, requires_grad=True)
+        The old singular-value classification used class 0 as its target.  The
+        first singular value almost always dominated, so cross entropy
+        saturated at zero and supplied no useful alignment gradient.  Here the
+        alignment term directly measures cosine disagreement between the base
+        activation and every LAP view.  The regularizer performs token-level
+        instance discrimination on the consensus representation and has its own
+        explicit weight so it cannot silently dominate alignment.
+        """
+        if not isinstance(embeddings_list, list) or len(embeddings_list) < 2:
+            raise ValueError("pmrl_loss expects at least two view tensors")
+        shapes = [tuple(view.shape) for view in embeddings_list]
+        if len(set(shapes)) != 1:
+            raise ValueError(f"PMRL view shapes differ: {shapes}")
+        views = torch.stack(embeddings_list, dim=1).float()  # [N, V, D]
+        if not torch.isfinite(views).all():
+            raise FloatingPointError("PMRL input contains NaN/Inf")
+        if tau_alignment <= 0 or tau_regularization <= 0:
+            raise ValueError("PMRL temperatures must be positive")
 
-        batch_size = Z.shape[0] 
-        device = Z.device
+        normalized = F.normalize(views, p=2, dim=-1, eps=1e-6)
+        if spectral_alignment:
+            # Paper-faithful RCSL: variants are rows of H_s [V, D]. Detach the
+            # original row as the asymmetric semantic anchor, and minimize the
+            # residual spectral energy outside the leading rank-1 direction.
+            anchor = normalized[:, :1, :].detach()
+            spectral_views = torch.cat([anchor, normalized[:, 1:, :]], dim=1)
+            singular_values = torch.linalg.svdvals(spectral_views)
+            energy = singular_values.square()
+            loss_alignment = (
+                energy[:, 1:].sum(dim=1)
+                / energy.sum(dim=1).clamp_min(1e-8)
+            ).mean() / tau_alignment
+        else:
+            base = normalized[:, :1, :].detach()
+            cosine = (base * normalized[:, 1:, :]).sum(dim=-1)
+            loss_alignment = ((1.0 - cosine) / tau_alignment).mean()
 
-        # --- Alignment Loss ---
-        alignment_targets = torch.zeros(batch_size, dtype=torch.long, device=device)
-        loss_alignment = F.cross_entropy(S / tau_alignment, alignment_targets)
-
-        # --- Regularization Loss ---
-        u1 = U[:, :, 0] # (N, D)
-        
-        # 矩阵乘法也在 float32 下进行，精度更高
-        logits_reg = torch.matmul(u1, u1.T) / tau_regularization
-        
-        reg_targets = torch.arange(batch_size, dtype=torch.long, device=device)
+        consensus = F.normalize(normalized.mean(dim=1), p=2, dim=-1, eps=1e-6)
+        logits_reg = torch.matmul(consensus, consensus.T) / tau_regularization
+        reg_targets = torch.arange(consensus.size(0), device=consensus.device)
         loss_regularization = F.cross_entropy(logits_reg, reg_targets)
 
-        # 4. 总损失
-        print("loss_alignment: {}, loss_regularization: {}".format(loss_alignment, loss_regularization))
-        total_loss = loss_alignment + lambda_reg * loss_regularization
-        
-        # 如果外部需要 float16 的 loss (通常不需要，因为 scalar loss 会自动适配)，可以 cast 回去
-        # 但通常建议保持 float32 直到 backward
+        # Balance regularization against the live alignment magnitude. This
+        # preserves the anti-collapse direction while preventing a raw CE term
+        # that is orders of magnitude larger from dominating optimization.
+        balanced_regularization = (
+            loss_regularization
+            / loss_regularization.detach().clamp_min(1e-8)
+            * loss_alignment.detach().clamp_min(1e-8)
+        )
+        total_loss = (
+            float(alignment_weight) * loss_alignment
+            + float(regularization_weight) * balanced_regularization
+        )
+        if not torch.isfinite(total_loss):
+            raise FloatingPointError("PMRL loss is non-finite")
+        print(
+            "loss_alignment: {}, loss_regularization: {}, "
+            "alignment_weight: {}, regularization_weight: {}".format(
+                loss_alignment, loss_regularization,
+                alignment_weight, regularization_weight,
+            )
+        )
+        if return_components:
+            return total_loss, {
+                "alignment": loss_alignment,
+                "regularization": loss_regularization,
+            }
         return total_loss
 
     def mllm_forward(self, multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k):
@@ -849,359 +892,380 @@ class WISEMultimodal(WISE):
 
 
     def _cal_ft_loss(self, multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len):
-        # print(multimodal_inputs)
-        if hasattr(self.model.config, 'batch_size'):
-            k = self.config.batch_size
-        else:
-            k = 1
-        
+        """Compute baseline WISE loss, optionally augmented by LAP + PMRL.
+
+        Baseline and enhancement are deliberately isolated: baseline always
+        performs the canonical edit and locality forwards first.  LAP sampling
+        is invoked only when all three enhancement switches are enabled.
+        """
+        k = self.config.batch_size if hasattr(self.model.config, "batch_size") else 1
         if k != 1:
             raise AssertionError("Not support Batch Edit")
 
-        pmrl_loss = torch.tensor(0.0, device=self.device if hasattr(self, 'device') else multimodal_inputs['input_ids'].device)
-        # ==========================================
-        # 针对 Llava-OV 的万能拼接逻辑 (手动替换 <image> Token)
-        # ==========================================
-        if "llava" in self.config.model_name.lower():
-            rephrase_samples = []
-            
-            with torch.no_grad():
-                # 1. 获取基础文本 Embedding
-                # shape: [batch, seq_len, embed_dim]
-                inputs_embeds = self.model.get_input_embeddings()(multimodal_inputs['input_ids'])
-                
-                # 2. 获取视觉特征 (之前的修复逻辑)
-                pixel_values = multimodal_inputs['pixel_values'].to(self.model.dtype)
-                if pixel_values.ndim == 5:
-                    bs, num_patches, channel, height, width = pixel_values.shape
-                    pixel_values = pixel_values.view(bs * num_patches, channel, height, width)
-                
-                image_outputs = self.model.model.vision_tower(pixel_values, output_hidden_states=True)
-                selected_image_feature = image_outputs.last_hidden_state
-                image_features = self.model.model.multi_modal_projector(selected_image_feature)
-                
-                # 3. 手动执行合并逻辑
-                # Llava-OV 的 input_ids 中，图像占位符通常是特定的 ID (self.config.image_token_index)
-                # 我们需要把 image_features 填到 inputs_embeds 中对应的位置
-                # 注意：Llava-OV 可能存在多个图像 Token 对应多个视觉特征块
-                
-                # 调用 transformers 提供的统一 pack 接口（这是 Llava-OV 最新的标准做法）
-                # 如果这个接口还报错，说明 transformers 版本非常特殊，我们将回退到 forward 逻辑
-                try:
-                    (
-                        final_inputs_embeds,
-                        final_attention_mask,
-                        final_labels,
-                        _ , _
-                    ) = self.model.pack_multimodal_resources(
-                        input_ids=multimodal_inputs['input_ids'],
-                        image_features=[image_features], # 期望列表
-                        attention_mask=multimodal_inputs['attention_mask'],
-                        labels=multimodal_inputs.get('labels'),
-                        image_sizes=multimodal_inputs.get('image_sizes')
-                    )
-                except AttributeError:
-                    # 如果 pack_multimodal_resources 也不存在，使用最原始的 forward 拦截法
-                    # 这种方法虽然略慢，但 100% 避开了 API 变动问题
-                    outputs = self.model(
-                        input_ids=multimodal_inputs['input_ids'],
-                        pixel_values=multimodal_inputs['pixel_values'],
-                        image_sizes=multimodal_inputs.get('image_sizes'),
-                        attention_mask=multimodal_inputs.get('attention_mask'),
-                        labels=multimodal_inputs.get('labels'),
-                        output_hidden_states=True,
-                        return_dict=True
-                    )
-                    # 直接从 forward 结果中提取已经拼接好的向量
-                    # 注意：这需要模型版本支持在 forward 中返回 inputs_embeds 
-                    # 或者我们通过 outputs.hidden_states[0] 获取第一层的输入（通常就是 inputs_embeds）
-                    final_inputs_embeds = outputs.hidden_states[0]
-                    final_attention_mask = multimodal_inputs.get('attention_mask')
-                    final_labels = multimodal_inputs.get('labels')
+        if self.config.model_name not in ("blip2", "minigpt4"):
+            edit_inputs, locality_inputs = multimodal_inputs
+            outputs = self.model(**edit_inputs)
+            adapter = self.get_adapter_layer()
+            edit_original_output = adapter.original_layer_output
+            edit_new_output = adapter.new_weight_layer_output
+            self.model(**locality_inputs)
+            locality_original_output = adapter.original_layer_output
+            locality_new_output = adapter.new_weight_layer_output
 
-                base_inputs_embeds = final_inputs_embeds
-                current_attention_mask = final_attention_mask
-                current_labels = final_labels
-
-            if self.config.using_extra and self.config.using_LAP:
-                # 此时 base_inputs_embeds 已经是拼接好的完整向量了
-                embeds_for_grad = base_inputs_embeds.detach().clone().requires_grad_(True)
-                
-                # 这里的调用不再传像素，只传拼接好的向量
-                outputs = self.model(
-                    inputs_embeds=embeds_for_grad,
-                    attention_mask=current_attention_mask,
-                    labels=current_labels,
-                    return_dict=True
+            shift_labels = edit_inputs["labels"][:, 1:].contiguous()
+            shift_logits = outputs.logits[:, :-1, :].contiguous()
+            token_loss = CrossEntropyLoss(reduction="none")(
+                shift_logits.reshape(-1, shift_logits.size(-1)),
+                shift_labels.reshape(-1),
+            ).view_as(shift_labels)
+            answer_mask = shift_labels.ne(-100)
+            if not answer_mask.any():
+                raise RuntimeError("HF multimodal edit batch contains no supervised target tokens")
+            ft_loss = (token_loss * answer_mask).sum() / answer_mask.sum()
+            enhancement_loss = outputs.logits.new_zeros(())
+            if (
+                getattr(self.config, "using_extra", False)
+                and getattr(self.config, "using_lap", False)
+                and getattr(self.config, "using_pmrl", False)
+            ):
+                enhancement_loss = self._compute_hf_lap_pmrl_loss(
+                    edit_inputs, edit_new_output
                 )
-                
-                # 获取用于求导的 Loss
-                # 如果 outputs.loss 存在则直接用，否则手动算
-                if outputs.loss is not None:
-                    J_LM = outputs.loss
-                else:
-                    logits = outputs.logits
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = current_labels[..., 1:].contiguous()
-                    loss_fct = torch.nn.CrossEntropyLoss(reduction='sum')
-                    J_LM = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
-                # 3. 计算针对 Embedding 的梯度
-                grad_full = torch.autograd.grad(
-                    outputs=J_LM,
-                    inputs=embeds_for_grad,
-                    retain_graph=False
-                )[0]
+            # LAP forwards overwrite the adapter slots. Install the exact
+            # baseline edit/locality pair for the activation-margin loss.
+            adapter.original_layer_output = torch.cat(
+                [edit_original_output.reshape(-1, edit_original_output.size(-1)),
+                 locality_original_output.reshape(-1, locality_original_output.size(-1))],
+                dim=0,
+            )
+            adapter.new_weight_layer_output = torch.cat(
+                [edit_new_output.reshape(-1, edit_new_output.size(-1)),
+                 locality_new_output.reshape(-1, locality_new_output.size(-1))],
+                dim=0,
+            )
+            adapter.wise_edit_activation_count = (
+                edit_original_output.numel() // edit_original_output.size(-1)
+            )
+            return ft_loss + enhancement_loss
 
-                # 5. 动态定位扰动区域 (避开答案部分)
-                # LLaVA-OV 的结构通常是 [Images, Prompts, Answers]
-                # 我们对末尾 ans_token_len 之前的区域加扰动
-                grad_base = grad_full[:, :-ans_token_len, :]
-                # epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
-                base_epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
+        edit_inputs, locality_inputs = multimodal_inputs
+        edit_outputs = self.model(edit_inputs)
+        adapter = self.get_adapter_layer()
+        edit_original_output = adapter.original_layer_output
+        edit_new_output = adapter.new_weight_layer_output
 
-                epsilon_list = torch.linspace(
-                    base_epsilon,
-                    base_epsilon * num_rephrase,
-                    steps=num_rephrase,
-                    device=grad_base.device,
-                    dtype=grad_base.dtype
-                )
-                num_rephrase = getattr(self.config, 'num_rephrase', 1)
+        self.model(locality_inputs)
+        locality_original_output = adapter.original_layer_output
+        locality_new_output = adapter.new_weight_layer_output
 
-                for i in range(num_rephrase):
-                    # 计算扰动 Delta
-                    epsilon = epsilon_list[i]
-                    grad_norm = torch.norm(grad_base, dim=-1, keepdim=True) + 1e-8
-                    delta = (grad_base / grad_norm) * epsilon
-                    
-                    # 应用扰动并拼接回答案部分
-                    noisy_img_prompt = base_inputs_embeds[:, :-ans_token_len, :].detach() + delta.detach()
-                    ans_part = base_inputs_embeds[:, -ans_token_len:, :].detach()
-                    perturbed_inputs_embeds = torch.cat([noisy_img_prompt, ans_part], dim=1)
-                    
-                    # 6. 第二次前向传播：提取扰动后的 Hidden States
-                    self.model(
-                        inputs_embeds=perturbed_inputs_embeds, 
-                        attention_mask=current_attention_mask
-                    )
-                    # 提取 Adapter 层的输出 (假设已有 Hook 记录)
-                    perturbed_output = super().get_adapter_layer().new_weight_layer_output
-                    rephrase_samples.append(perturbed_output)
+        enhancement_loss = edit_outputs.logits.new_zeros(())
+        if (
+            getattr(self.config, "using_extra", False)
+            and getattr(self.config, "using_lap", False)
+            and getattr(self.config, "using_pmrl", False)
+        ):
+            enhancement_loss = self._compute_lap_pmrl_loss(
+                edit_inputs, ans_token_len, edit_new_output
+            )
 
-                # 7. 获取原始状态作为对照组
-                self.model(
-                    inputs_embeds=base_inputs_embeds, 
-                    attention_mask=current_attention_mask
-                )
-                base_output = super().get_adapter_layer().new_weight_layer_output
-                rephrase_samples.append(base_output.detach())
+        # Enhancement forwards overwrite adapter captures. Restore the exact
+        # edit/locality pair needed by baseline WISE activation separation.
+        adapter.original_layer_output = torch.cat(
+            [
+                edit_original_output.reshape(-1, edit_original_output.size(-1)),
+                locality_original_output.reshape(-1, locality_original_output.size(-1)),
+            ],
+            dim=0,
+        )
+        adapter.new_weight_layer_output = torch.cat(
+            [
+                edit_new_output.reshape(-1, edit_new_output.size(-1)),
+                locality_new_output.reshape(-1, locality_new_output.size(-1)),
+            ],
+            dim=0,
+        )
+        adapter.wise_edit_activation_count = (
+            edit_original_output.numel() // edit_original_output.size(-1)
+        )
 
-                # 8. 计算 PMRL Loss (Alignment + Regularization)
-                diff = torch.norm(rephrase_samples[0] - rephrase_samples[-1])
-                print(f"DEBUG: Sample difference norm: {diff.item()}")
-                pmrl_loss = self.pmrl_loss(
-                    rephrase_samples, 
-                    tau_alignment=self.config.pmrl_tau_alignment, 
-                    tau_regularization=self.config.pmrl_tau_regularization
-                ) * self.config.pmrl_scale
+        shift_labels = edit_outputs.labels[:, 1:].contiguous()
+        shift_logits = edit_outputs.logits[:, :-1, :].contiguous()
+        token_loss = CrossEntropyLoss(reduction="none")(
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+        ).view(shift_labels.shape[0], -1)
+        answer_mask = shift_labels.ne(-100)
+        ft_loss = (
+            (token_loss * answer_mask).sum(1)
+            / answer_mask.sum(1).clamp_min(1)
+        ).mean()
+        return ft_loss + enhancement_loss
 
-            # # 9. 最终的 FT Loss 计算
-            # # 这里的 outputs 来自第 7 步的原始输入传播
-            outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
-            print(f"pmrl_loss: {pmrl_loss.item()}")
-    
-            loss_fct = CrossEntropyLoss(reduction='none')
-            a = shift_logits.view(-1, shift_logits.size(-1))
-            b = shift_labels.view(-1)[-ans_token_len:]
-            a = a[-b.size(0):,:]
-            loss = loss_fct(a, b)
-            loss = loss.view(bs, -1)
-            label_mask = torch.ones_like(loss, dtype=torch.bool)        
-            ft_loss = ((loss * label_mask).sum(1) / label_mask.sum(1)).mean()
+    def _compute_lap_pmrl_loss(self, edit_inputs, ans_token_len, base_output):
+        """Generate LAP views and calculate PMRL without filesystem effects."""
+        if self.config.model_name not in ("blip2", "minigpt4"):
+            raise NotImplementedError("LAP + PMRL is currently validated for BLIP2-style wrappers")
 
-            return ft_loss + pmrl_loss
+        inputs_embeds, attention_mask, targets = self.model.image_encoding(edit_inputs)
+        probe_embeds = inputs_embeds.detach().clone().requires_grad_(True)
+        probe_result = self.model.LLM_forward(probe_embeds, attention_mask, targets)
+        probe_outputs = probe_result[0] if isinstance(probe_result, tuple) else probe_result
+        probe_logits = probe_outputs.logits
+        probe_labels = targets[:, 1:].contiguous()
+        probe_shift_logits = probe_logits[:, :-1, :].contiguous()
+        probe_loss = CrossEntropyLoss(reduction="sum")(
+            probe_shift_logits.reshape(-1, probe_shift_logits.size(-1)),
+            probe_labels.reshape(-1),
+        )
+        grad_full = torch.autograd.grad(probe_loss, probe_embeds, retain_graph=False)[0]
 
-        if self.config.using_extra:
-            # blip2中，前32个token是image embedding
-            # base_features = self.hidden_states[0, :-ans_token_len, :]
-            rephrase_samples = []
-            if self.config.using_dropout:
-                inputs_embeds, attention_mask, targets = self.model.image_encoding(multimodal_inputs[0])
-                # img_part = inputs_embeds[:, :-1, :] 
-                # txt_part = inputs_embeds[:, -1:, :]
-                img_part = inputs_embeds[:, :-ans_token_len, :]
-                txt_part = inputs_embeds[:, -ans_token_len:, :]
-                # img_part = inputs_embeds[:, :32, :] 
-                # txt_part = inputs_embeds[:, 32:, :]
-                sample_nums = 2
-                noisy_img_sample = []
-                for _ in range(sample_nums):
-                    if True:
-                        # embedding上直接扰动的方法
-                        noisy_img_part = F.dropout(img_part, p=0.1, training=True)
-                        # noisy_img_part = img_part
-                        perturbed_inputs_embeds = torch.cat([noisy_img_part, txt_part], dim=1)
-                        # perturbed_inputs_embeds = noisy_img_part
-                        self.model.LLM_forward(perturbed_inputs_embeds, attention_mask, targets)
-                    else:
-                        # simCSE实现方法
-                        perturbed_inputs_embeds = copy.deepcopy(inputs_embeds)
-                        self.model.LLM_forward(perturbed_inputs_embeds, attention_mask, targets, using_dropout=True)
-                    current_perturbed_output = super().get_adapter_layer().new_weight_layer_output
-                    rephrase_samples.append(current_perturbed_output)
-                outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
-                base_output = super().get_adapter_layer().new_weight_layer_output
-                base_output = base_output.reshape(2, -1, base_output.size(-1))[0].detach()
-                rephrase_samples.append(base_output)
-                # print("base_output shape: ", base_output)
-                # print("perturbed_output shape: ", perturbed_output)
-            elif self.config.using_LAP:
-                if True:
-                    # 0. 获取生成数量，默认为1
-                    num_rephrase = getattr(self.config, 'num_rephrase', 5)
-
-                    # 1. 基础编码（仅需一次）
-                    # 对embedding层进行扰动的方法
-                    inputs_embeds, attention_mask, targets = self.model.image_encoding(multimodal_inputs[0])
-
-                    # 2. 准备求导环境：Detach -> Clone -> Requires Grad
-                    embeds_for_grad = inputs_embeds.detach().clone()
-                    embeds_for_grad.requires_grad_(True)
-
-                    # 3. 前向传播计算梯度基础
-                    outputs = self.model.LLM_forward(embeds_for_grad, attention_mask, targets)
-
-                    # =============== 健壮的 Logits 提取 ===============
-                    if hasattr(outputs, 'logits'):
-                        logits = outputs.logits
-                    elif isinstance(outputs, tuple):
-                        logits = outputs[0].logits
-                    else:
-                        logits = outputs
-                    # ==========================================================
-
-                    # 4. 计算 Loss
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = targets[..., 1:].contiguous()
-
-                    a = shift_logits.view(-1, shift_logits.size(-1))
-                    b = shift_labels.view(-1)[-ans_token_len:]
-                    a = a[-b.size(0):,:]
-
-                    loss_fct_inner = torch.nn.CrossEntropyLoss(reduction='sum')
-                    J_LM = loss_fct_inner(a, b)
-
-                    # 5. 反向传播获取基础梯度
-                    grad_full = torch.autograd.grad(
-                        outputs=J_LM,
-                        inputs=embeds_for_grad,
-                        retain_graph=False,
-                        only_inputs=True,
-                        allow_unused=True
-                    )[0]
-
-                    if self.config.using_imageembedding:
-                        print("using_imageembedding")
-                        grad_base = grad_full[:, :32, :]
-                    else: grad_base = grad_full[:, :-ans_token_len, :]
-                    epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
-
-                    # 6. 循环生成多个样本
-                    for i in range(num_rephrase):
-                        # 计算扰动 Delta
-                        # 注意：如果需要每个样本不同，通常在这里加入随机噪声，例如：
-                        # noise = torch.randn_like(grad_base) * some_scale
-                        grad_norm = torch.norm(grad_base, dim=-1, keepdim=True) + 1e-8
-                        delta = (grad_base / grad_norm) * epsilon
-                        
-                        # 7. 应用扰动并生成样本
-                        # 使用 detach() 确保扰动后的输入是从新的计算图开始的
-                        if self.config.using_imageembedding:
-                            noisy_img_part = inputs_embeds[:, :32, :].detach() + delta.detach()
-                            txt_part = inputs_embeds[:, 32:, :].detach()
-                        else:
-                            noisy_img_part = inputs_embeds[:, :-ans_token_len, :].detach() + delta.detach()
-                            txt_part = inputs_embeds[:, -ans_token_len:, :].detach()
-                        perturbed_inputs_embeds = torch.cat([noisy_img_part, txt_part], dim=1)
-                        
-                        # 确保 requires_grad 根据需要开启（如果后续还需要对这个前向过程求导）
-                        # perturbed_inputs_embeds.requires_grad_(True) 
-
-                        # 8. 独立前向传播以更新 adapter 状态并获取输出
-                        # 每次调用都会进入该次循环所属的独立计算图
-                        self.model.LLM_forward(perturbed_inputs_embeds, attention_mask, targets)
-                        
-                        # 获取当前前向传播捕获的特定层输出
-                        perturbed_output = super().get_adapter_layer().new_weight_layer_output
-                        rephrase_samples.append(perturbed_output)
-                else:
-                    # 在编辑层的实现方法（untested）
-                    outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
-                    
-                    a = shift_logits.view(-1, shift_logits.size(-1))
-                    b = shift_labels.view(-1)[-ans_token_len:]
-                    a = a[-b.size(0):,:]
-
-                    base_hidden_state_input = super().get_adapter_layer().hidden_state_input
-                    embeds_for_grad = base_hidden_state_input.detach().clone()
-                    embeds_for_grad.requires_grad_(True)
-                    
-                    loss_fct_inner = torch.nn.CrossEntropyLoss(reduction='sum')
-                    J_LM = loss_fct_inner(a, b)
-
-                    # 5. 反向传播求导
-                    grad_full = torch.autograd.grad(
-                        outputs=J_LM,
-                        inputs=embeds_for_grad,
-                        retain_graph=False,
-                        only_inputs=True,
-                        allow_unused=True
-                    )[0]
-
-                    # 6. 计算扰动 Delta
-                    grad_base = grad_full[:, :32, :]
-                    epsilon = getattr(self.config, 'lap_epsilon', 1e-3)
-                    
-                    grad_norm = torch.norm(grad_base, dim=-1, keepdim=True) + 1e-8
-                    delta = (grad_base / grad_norm) * epsilon
-                    
-                    # 7. 应用扰动并生成样本 (Rephrase Sample 1)
-                    noisy_img_part = base_hidden_state_input[:, :32, :] + delta.detach()
-                    txt_part = base_hidden_state_input[:, 32:, :]
-                    perturbed_inputs_embeds = torch.cat([noisy_img_part, txt_part], dim=1)
-                    
-                    # 再次前向传播以更新 adapter 状态
-                    self.model.LLM_forward(perturbed_inputs_embeds, attention_mask, targets)
-                    perturbed_output = super().get_adapter_layer().new_weight_layer_output
-                    rephrase_samples.append(perturbed_output)
-
-                # 8. 获取 Base Output (Rephrase Sample 2)
-                # 传入原始 embedding 再次前向传播
-                self.model.LLM_forward(inputs_embeds, attention_mask, targets)
-                base_output = super().get_adapter_layer().new_weight_layer_output
-                # print("base_output.shape:", base_output.shape)
-                rephrase_samples.append(base_output.detach())
-
-                # 恢复正常的 outputs 用于函数返回
-                outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
-            # mmd_loss = self.mmd_loss(rephrase_samples[0], rephrase_samples[1])
-            pmrl_loss = self.pmrl_loss(rephrase_samples, tau_alignment=self.config.pmrl_tau_alignment, tau_regularization=self.config.pmrl_tau_regularization) * self.config.pmrl_scale
+        if getattr(self.config, "using_image_embedding", False):
+            perturb_end = min(32, inputs_embeds.size(1))
         else:
-            outputs, logits, labels, shift_labels, shift_logits, bs = self.mllm_forward(multimodal_inputs, text_tokens, last_prompt_token_loc, ans_token_len, k)
+            perturb_end = max(1, inputs_embeds.size(1) - int(ans_token_len))
+        grad_base = grad_full[:, :perturb_end, :]
+        grad_direction = grad_base / torch.norm(
+            grad_base, dim=-1, keepdim=True
+        ).clamp_min(1e-8)
 
-        print(f"pmrl_loss: {pmrl_loss.item()}")
-        # print(f"mmd_loss: {mmd_loss.item()}")
+        views = [base_output]
+        num_rephrase = int(getattr(self.config, "num_rephrase", 5))
+        epsilon = float(getattr(self.config, "lap_epsilon", 1e-3))
+        for sample_idx in range(num_rephrase):
+            scale = epsilon * float(sample_idx + 1)
+            perturbed = inputs_embeds.detach().clone()
+            perturbed[:, :perturb_end, :] += grad_direction.detach() * scale
+            self.model.LLM_forward(perturbed, attention_mask, targets)
+            views.append(self.get_adapter_layer().new_weight_layer_output)
 
+        flattened = [view.reshape(-1, view.size(-1)) for view in views]
+        common_length = min(view.size(0) for view in flattened)
+        aligned_views = [view[:common_length] for view in flattened]
+        return self.pmrl_loss(
+            aligned_views,
+            tau_alignment=float(self.config.pmrl_tau_alignment),
+            tau_regularization=float(self.config.pmrl_tau_regularization),
+            alignment_weight=float(getattr(self.config, "pmrl_alignment_weight", 1.0)),
+            regularization_weight=float(getattr(self.config, "pmrl_regularization_weight", 0.1)),
+            spectral_alignment=bool(getattr(self.config, "pmrl_spectral_alignment", False)),
+        ) * float(self.config.pmrl_scale)
 
-        # only cal loss of target text tokens
-        loss_fct = CrossEntropyLoss(reduction='none')
-        a = shift_logits.view(-1, shift_logits.size(-1))
-        b = shift_labels.view(-1)[-ans_token_len:]
-        a = a[-b.size(0):,:]
-        loss = loss_fct(a, b)
-        loss = loss.view(bs, -1)
-        label_mask = torch.ones_like(loss, dtype=torch.bool)        
-        ft_loss = ((loss * label_mask).sum(1) / label_mask.sum(1)).mean()
-        return ft_loss + pmrl_loss
-        # return ft_loss + mmd_loss
+    def _build_lar_perturbations(
+        self, base_embeds, gradient, mask, num_views, epsilon,
+        random_start=False, pgd_steps=1, step_size=None,
+    ):
+        """Projected adversarial variants with optional random initialization."""
+        mask_f = mask.unsqueeze(-1).to(base_embeds.dtype)
+        grad = gradient * mask_f
+        grad_norm = grad.float().flatten(1).norm(dim=1).clamp_min(1e-8)
+        direction = grad / grad_norm.to(grad.dtype).view(-1, 1, 1)
+        step_size = float(step_size if step_size is not None else epsilon)
+        variants = []
+        for view_idx in range(int(num_views)):
+            if random_start:
+                delta = torch.randn_like(base_embeds) * mask_f
+                norm = delta.float().flatten(1).norm(dim=1).clamp_min(1e-8)
+                radius = torch.rand(
+                    delta.size(0), device=delta.device, dtype=torch.float32
+                ) * float(epsilon)
+                delta = delta / norm.to(delta.dtype).view(-1, 1, 1)
+                delta = delta * radius.to(delta.dtype).view(-1, 1, 1)
+            else:
+                # Backward-compatible deterministic sweep across the bounded
+                # ray; unlike the old path every view remains inside epsilon.
+                delta = direction * (
+                    float(epsilon) * float(view_idx + 1) / float(num_views)
+                )
+            if random_start:
+                for _step in range(max(1, int(pgd_steps))):
+                    delta = (delta + direction * step_size) * mask_f
+                    norm = delta.float().flatten(1).norm(dim=1).clamp_min(1e-8)
+                    factor = (float(epsilon) / norm).clamp(max=1.0)
+                    delta = delta * factor.to(delta.dtype).view(-1, 1, 1)
+            variants.append(delta.detach())
+        return variants
+
+    def _prepare_hf_lap_inputs(self, multimodal_inputs):
+        """Build fused embeddings and forward kwargs for supported HF MLLMs."""
+        model = self.model
+        core = model.model
+        input_ids = multimodal_inputs["input_ids"]
+        text_embeds = core.get_input_embeddings()(input_ids)
+        model_name = self.config.model_name.lower()
+        if "qwen2-vl" in model_name:
+            image_features = core.get_image_features(
+                multimodal_inputs["pixel_values"],
+                multimodal_inputs.get("image_grid_thw"),
+            )
+        elif "llava-onevision" in model_name:
+            image_features = core.get_image_features(
+                multimodal_inputs["pixel_values"],
+                multimodal_inputs["image_sizes"],
+                batch_num_images=multimodal_inputs.get("batch_num_images"),
+            )
+        else:
+            raise NotImplementedError(
+                f"HF LAP + PMRL does not support model {self.config.model_name}"
+            )
+        image_features = torch.cat(image_features, dim=0).to(
+            text_embeds.device, text_embeds.dtype
+        )
+        image_mask, _ = core.get_placeholder_mask(
+            input_ids, inputs_embeds=text_embeds, image_features=image_features
+        )
+        fused_embeds = text_embeds.masked_scatter(image_mask, image_features)
+        forward_kwargs = {
+            "attention_mask": multimodal_inputs["attention_mask"],
+            "use_cache": False,
+            "return_dict": True,
+        }
+        if "qwen2-vl" in model_name:
+            position_ids, _ = core.get_rope_index(
+                input_ids,
+                multimodal_inputs.get("image_grid_thw"),
+                multimodal_inputs.get("video_grid_thw"),
+                multimodal_inputs["attention_mask"],
+            )
+            forward_kwargs["position_ids"] = position_ids
+        return fused_embeds, image_mask.any(dim=-1), forward_kwargs
+
+    def _hf_target_loss(self, logits, labels, reduction):
+        """Return target-token CE without promoting the full vocab logits to fp32."""
+        shift_labels = labels[:, 1:].contiguous()
+        shift_logits = logits[:, :-1, :].contiguous()
+        valid = shift_labels.ne(-100)
+        if not valid.any():
+            raise RuntimeError("HF LAP probe has no supervised target tokens")
+        selected_logits = shift_logits[valid]
+        selected_labels = shift_labels[valid]
+        if not torch.isfinite(selected_logits).all():
+            raise FloatingPointError("HF LAP target logits are non-finite")
+        return CrossEntropyLoss(reduction=reduction)(selected_logits, selected_labels)
+
+    def _compute_hf_lap_pmrl_loss(self, multimodal_inputs, base_output):
+        """Generate LAP views from fused HF vision/text embeddings."""
+        model = self.model
+        fused_embeds, visual_token_mask, forward_kwargs = self._prepare_hf_lap_inputs(
+            multimodal_inputs
+        )
+        probe_embeds = fused_embeds.detach().clone().requires_grad_(True)
+        probe_outputs = model(inputs_embeds=probe_embeds, **forward_kwargs)
+        probe_loss = self._hf_target_loss(
+            probe_outputs.logits, multimodal_inputs["labels"], reduction="sum"
+        )
+        if not torch.isfinite(probe_loss):
+            raise FloatingPointError("HF LAP probe loss is non-finite")
+        grad_full = torch.autograd.grad(
+            probe_loss, probe_embeds, retain_graph=False
+        )[0]
+
+        answer_mask = multimodal_inputs["labels"].ne(-100)
+        if getattr(self.config, "lar_joint_perturbation", False):
+            perturb_mask = (~answer_mask) & multimodal_inputs["attention_mask"].bool()
+        elif getattr(self.config, "using_image_embedding", False):
+            perturb_mask = visual_token_mask
+        else:
+            perturb_mask = (~answer_mask) & multimodal_inputs["attention_mask"].bool()
+        if not perturb_mask.any():
+            raise RuntimeError("HF LAP perturbation mask is empty")
+        masked_grad = grad_full * perturb_mask.unsqueeze(-1).to(grad_full.dtype)
+        denom = masked_grad.float().flatten(1).norm(dim=1)
+        random_start = bool(getattr(self.config, "lar_random_start", False))
+        if not torch.isfinite(denom).all():
+            raise RuntimeError("LAP gradient is non-finite on selected HF multimodal region")
+        if torch.any(denom == 0) and not random_start:
+            raise RuntimeError("LAP gradient is zero on selected HF multimodal region")
+        direction = masked_grad / denom.clamp_min(1e-8).to(masked_grad.dtype).view(-1, 1, 1)
+
+        views = [base_output.detach()]
+        variant_target_losses = []
+        epsilon = float(getattr(self.config, "lap_epsilon", 1e-3))
+        num_rephrase = int(getattr(self.config, "num_rephrase", 5))
+        random_start = bool(getattr(self.config, "lar_random_start", False))
+        pgd_steps = int(getattr(self.config, "lar_pgd_steps", 1))
+        step_size = float(getattr(self.config, "lar_step_size", epsilon))
+        if random_start:
+            perturbations = []
+            mask_f = perturb_mask.unsqueeze(-1).to(fused_embeds.dtype)
+            for _view_idx in range(num_rephrase):
+                delta = torch.randn_like(fused_embeds) * mask_f
+                delta_norm = delta.float().flatten(1).norm(dim=1).clamp_min(1e-8)
+                radius = torch.rand(
+                    delta.size(0), device=delta.device, dtype=torch.float32
+                ) * epsilon
+                delta = delta / delta_norm.to(delta.dtype).view(-1, 1, 1)
+                delta = delta * radius.to(delta.dtype).view(-1, 1, 1)
+                # Paper-faithful randomized projected ascent: recompute the
+                # adversarial gradient at each independent random start.
+                for _step in range(max(1, pgd_steps)):
+                    candidate = (
+                        fused_embeds.detach() + delta.detach()
+                    ).requires_grad_(True)
+                    candidate_outputs = model(inputs_embeds=candidate, **forward_kwargs)
+                    candidate_loss = self._hf_target_loss(
+                        candidate_outputs.logits,
+                        multimodal_inputs["labels"],
+                        reduction="sum",
+                    )
+                    candidate_grad = torch.autograd.grad(
+                        candidate_loss, candidate, retain_graph=False
+                    )[0] * mask_f
+                    candidate_norm = candidate_grad.float().flatten(1).norm(
+                        dim=1
+                    ).clamp_min(1e-8)
+                    candidate_direction = candidate_grad / candidate_norm.to(
+                        candidate_grad.dtype
+                    ).view(-1, 1, 1)
+                    delta = (delta + candidate_direction * step_size) * mask_f
+                    delta_norm = delta.float().flatten(1).norm(dim=1).clamp_min(1e-8)
+                    factor = (epsilon / delta_norm).clamp(max=1.0)
+                    delta = delta * factor.to(delta.dtype).view(-1, 1, 1)
+                perturbations.append(delta.detach())
+        else:
+            perturbations = self._build_lar_perturbations(
+                fused_embeds,
+                grad_full,
+                perturb_mask,
+                num_views=num_rephrase,
+                epsilon=epsilon,
+                random_start=False,
+                pgd_steps=1,
+                step_size=step_size,
+            )
+        for delta in perturbations:
+            perturbed = fused_embeds.detach() + delta
+            variant_outputs = model(inputs_embeds=perturbed, **forward_kwargs)
+            views.append(self.get_adapter_layer().new_weight_layer_output)
+            variant_target_losses.append(
+                self._hf_target_loss(
+                    variant_outputs.logits,
+                    multimodal_inputs["labels"],
+                    reduction="mean",
+                )
+            )
+
+        shapes = [tuple(view.shape) for view in views]
+        if len(set(shapes)) != 1:
+            raise RuntimeError(f"HF LAP view shapes differ: {shapes}")
+        if not any(
+            torch.norm((view - views[0]).float()).item() > 0 for view in views[1:]
+        ):
+            raise RuntimeError("HF LAP produced identical adapter views")
+        flattened = [view.reshape(-1, view.size(-1)) for view in views]
+        representation_loss = self.pmrl_loss(
+            flattened,
+            tau_alignment=float(self.config.pmrl_tau_alignment),
+            tau_regularization=float(self.config.pmrl_tau_regularization),
+            alignment_weight=float(getattr(self.config, "pmrl_alignment_weight", 1.0)),
+            regularization_weight=float(getattr(self.config, "pmrl_regularization_weight", 0.1)),
+            spectral_alignment=bool(getattr(self.config, "pmrl_spectral_alignment", False)),
+        ) * float(self.config.pmrl_scale)
+        target_weight = float(getattr(self.config, "lar_target_loss_weight", 0.0))
+        variant_target_loss = torch.stack(variant_target_losses).mean()
+        print(
+            "lar_variant_target_loss: {}, lar_target_loss_weight: {}".format(
+                variant_target_loss, target_weight
+            )
+        )
+        return representation_loss + target_weight * variant_target_loss

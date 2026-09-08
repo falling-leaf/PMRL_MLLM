@@ -49,6 +49,28 @@ class WISEMultimodalHyperParams(HyperParams):
     tokenizer_name: str
     dtype: torch.dtype
 
+    # Optional LAP + PMRL enhancement. When using_extra is false the WISE
+    # optimization and evaluation paths remain baseline-only.
+    using_extra: bool = False
+    using_lap: bool = False
+    using_pmrl: bool = False
+    using_image_embedding: bool = False
+    num_rephrase: int = 5
+    lap_epsilon: float = 1e-3
+    pmrl_tau_alignment: float = 0.05
+    pmrl_tau_regularization: float = 0.1
+    pmrl_alignment_weight: float = 1.0
+    pmrl_regularization_weight: float = 0.1
+    pmrl_scale: float = 1.0
+    lar_random_start: bool = False
+    lar_pgd_steps: int = 1
+    lar_step_size: float = 1e-3
+    lar_joint_perturbation: bool = False
+    lar_target_loss_weight: float = 0.0
+    pmrl_visual_pooling: bool = False
+    pmrl_spectral_alignment: bool = False
+    export_lap_samples: bool = False
+
     # Defaults
     batch_size: int = 1
     max_length: int = 30

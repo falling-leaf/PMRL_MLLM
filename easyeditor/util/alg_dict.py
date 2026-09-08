@@ -13,6 +13,15 @@ from ..models.lora import LoRAHyperParams, apply_lora_to_model, apply_lora_to_mu
 from ..models.grace import GraceHyperParams, apply_grace_to_model, apply_grace_to_multimodal_model
 from ..models.pmet import PMETHyperParams, apply_pmet_to_model
 from ..models.melo import MELOHyperParams, apply_melo_to_model
+from ..models.transformer_patcher import (
+    TransformerPatcherMultimodalHyperParams,
+    apply_transformer_patcher_to_multimodal_model,
+)
+from ..models.unike_blip2 import apply_unike_blip2_to_multimodal_model
+from ..models.unike_simplified import (
+    UniKESimplifiedHyperParams,
+    apply_unike_simplified_to_multimodal_model,
+)
 from ..models.wise import WISEHyperParams, apply_wise_to_model, apply_wise_to_multimodal_model
 from ..models.r_rome import R_ROMEHyperParams, apply_r_rome_to_model
 from ..models.emmet import EMMETHyperParams, apply_emmet_to_model
@@ -57,6 +66,9 @@ ALG_MULTIMODAL_DICT = {
     'IKE': apply_ike_to_multimodal_model,
     'LoRA': apply_lora_to_multimodal_model,
     'WISE': apply_wise_to_multimodal_model,
+    'Transformer-Patcher': apply_transformer_patcher_to_multimodal_model,
+    'UniKE-BLIP2': apply_unike_blip2_to_multimodal_model,
+    'UniKE-Simplified': apply_unike_simplified_to_multimodal_model,
     'GRACE': apply_grace_to_multimodal_model
 }
 

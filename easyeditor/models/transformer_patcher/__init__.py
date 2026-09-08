@@ -1,0 +1,2 @@
+from .transformer_patcher_main import apply_transformer_patcher_to_multimodal_model
+from .transformer_patcher_multimodal_hparams import TransformerPatcherMultimodalHyperParams

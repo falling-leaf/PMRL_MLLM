@@ -89,7 +89,7 @@ def _patched_parameters(
     return iter(self._fast_params[time])
 
 
-class _MonkeyPatchBase(_abc.ABC, _torch.nn.Module):
+class _MonkeyPatchBase(_abc.ABC):
     @_abc.abstractmethod
     def __init__(self) -> None:
         self._param_mapping: _typing.List[int] = []
@@ -321,6 +321,23 @@ def _make_functional(
 
     MonkeyPatched.__name__ = "InnerFunctional" + type(module).__name__
     MonkeyPatched.__qualname__ = MonkeyPatched.__name__
+
+    # Fix ModuleList.__getitem__ with slices.  The higher monkeypatch creates a
+    # MonkeyPatched subclass of ModuleList whose __init__ signature does not
+    # match ModuleList.__init__(modules).  Intercept __getitem__ so that
+    # slicing (e.g. self.layers[:N]) returns a plain ModuleList.
+    if isinstance(module, _torch.nn.ModuleList):
+        _orig_getitem = type(module).__getitem__
+
+        def _patched_getitem(self, idx):
+            if isinstance(idx, slice):
+                # Return a plain ModuleList, not a MonkeyPatched one.
+                return _torch.nn.ModuleList(
+                    list(self._modules.values())[idx]
+                )
+            return _orig_getitem(self, idx)
+
+        setattr(MonkeyPatched, "__getitem__", _patched_getitem)
 
     fmodule = MonkeyPatched(module.parameters(), root=root_patched)
 

@@ -3,6 +3,7 @@ from ...util.hparams import HyperParams
 from .mend_hparams import MENDHyperParams
 from typing import Optional, Any, List
 import yaml
+import torch
 
 
 @dataclass
@@ -90,6 +91,23 @@ class MENDMultimodalHparams(HyperParams):
     qformer_checkpoint: Optional[str] = None
     freeze_qformer: bool = True
     pretrained_ckpt: Optional[str] = None  
+    dtype: torch.dtype = torch.bfloat16
+    sequential_edit: bool = False
+
+    # Optional MEND enhancement. The baseline is strictly isolated unless all
+    # three gates are enabled.
+    using_extra: bool = False
+    using_lap: bool = False
+    using_pmrl: bool = False
+    using_image_embedding: bool = True
+    num_rephrase: int = 5
+    lap_epsilon: float = 0.001
+    pmrl_tau_alignment: float = 0.05
+    pmrl_tau_regularization: float = 0.1
+    pmrl_alignment_weight: float = 1.0
+    pmrl_regularization_weight: float = 0.1
+    pmrl_scale: float = 1.0
+    mend_log_grad_diagnostics: bool = False
     
     @classmethod
     def from_hparams(cls, hparams_name_or_path: str):
@@ -100,6 +118,8 @@ class MENDMultimodalHparams(HyperParams):
         with open(hparams_name_or_path, "r") as stream:
             config = yaml.safe_load(stream)
             config = super().construct_float_from_scientific_notation(config)
+        if isinstance(config.get("dtype"), str):
+            config["dtype"] = getattr(torch, config["dtype"].replace("torch.", ""))
 
         assert (config and config['alg'] == 'MEND') or print(f'MENDMultimodalHyperParams can not load from {hparams_name_or_path}, '
                                                 f'alg_name is {config["alg"]} ')

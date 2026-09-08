@@ -157,8 +157,33 @@ class MultimodalTrainer(BaseTrainer):
             l_total_edit = self.config.cedit * l_edit + self.config.cloc * (l_loc + l_image_loc) + self.config.iedit * l_image_edit
         
 
+        info_dict = {}
+        if getattr(self.config, "mend_log_grad_diagnostics", False):
+            info_dict["diag/post_requires_grad"] = float(post_edit_logits.requires_grad)
+            info_dict["diag/post_grad_fn"] = float(post_edit_logits.grad_fn is not None)
+            info_dict["diag/l_total_requires_grad"] = float(l_total_edit.requires_grad)
         if training and self.config.alg != 'ft':
-            safe_backward(l_total_edit, self.model.outer_parameters(), self.config.accumulate_bs, allow_unused=True)
+            # The post-edit model is a functional HF model. The MEND wrapper
+            # remains the owner of the transform parameters and optimizer state;
+            # its parameters are the leaves referenced by the fast-weight update.
+            outer_parameters = list(self.model.outer_parameters())
+            safe_backward(l_total_edit, outer_parameters, self.config.accumulate_bs, allow_unused=True)
+            if self.config.alg.upper() == "MEND" and not any(
+                p.grad is not None for p in outer_parameters
+            ):
+                raise RuntimeError(
+                    "MEND meta-gradient is disconnected: all outer parameters are unused"
+                )
+            if getattr(self.config, "mend_log_grad_diagnostics", False):
+                outer = list(outer_parameters)
+                info_dict["diag/outer_nonnull"] = float(sum(p.grad is not None for p in outer))
+                info_dict["diag/outer_nonzero"] = float(sum(
+                    p.grad is not None and torch.isfinite(p.grad).all()
+                    and p.grad.float().norm() > 0 for p in outer
+                ))
+                info_dict["diag/outer_norm"] = float(sum(
+                    p.grad.float().norm().item() for p in outer if p.grad is not None
+                ))
 
         # Text locality
         post_base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(post_base_logits, dim=-1), k=1, dim=-1).indices
@@ -168,7 +193,6 @@ class MultimodalTrainer(BaseTrainer):
         post_image_base_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(post_image_base_logits, dim=-1), k=10, dim=-1).indices
         base_image_logits_softmax_top_k = torch.topk(torch.nn.functional.softmax(base_image_logits, dim=-1), k=10, dim=-1).indices
 
-        info_dict = {}
         info_dict['loss/edit'] = l_edit.item()
         info_dict['loss/image_edit'] = l_image_edit.item()
         info_dict['loss/loc'] = l_loc.item()
@@ -188,6 +212,9 @@ class MultimodalTrainer(BaseTrainer):
         info_dict["memory/alloc_max"] = torch.cuda.max_memory_allocated()
         info_dict["memory/res_max"] = torch.cuda.max_memory_reserved()
         info_dict = {**info_dict, **model_info}
+        del edited_model, model_info
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
         return l_total, l_edit, l_loc, l_base, info_dict
 
