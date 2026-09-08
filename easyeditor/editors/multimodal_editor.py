@@ -150,12 +150,12 @@ class MultimodalEditor:
 
             elif "qwen2-vl" in hparams.model_name.lower():
                 self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-                    hparams.model_name, 
+                    hparams.name,
                     torch_dtype=hparams.dtype,
                     # attn_implementation="flash_attention_2"
                 )
                 self.vis_tok = Qwen2VLProcessor()
-                self.tok = AutoProcessor.from_pretrained(hparams.model_name)
+                self.tok = AutoProcessor.from_pretrained(hparams.name)
                 self.model_name = "qwen2-vl"
                 
         else:
@@ -576,7 +576,8 @@ class MultimodalEditor:
                         self.hparams,
                         copy=False,
                         return_orig_weights=True,
-                        keep_original_weight=keep_original_weight
+                        keep_original_weight=keep_original_weight,
+                        sample_id=i if self.alg_name == 'UniKE-BLIP2' else None,
                     )
                 exec_time = time() - start
                 LOG.info(f"Execution {i} editing took {exec_time}")
@@ -657,7 +658,9 @@ class MultimodalEditor:
                         f"{i} editing: {request['prompt']} -> {request['target']}  \n {metrics}"
                     )
 
-                    all_metrics.append(metrics)
+                all_metrics.append(metrics)
+                if callable(weights_copy):
+                    weights_copy()
 
         return all_metrics, edited_model, weights_copy
 

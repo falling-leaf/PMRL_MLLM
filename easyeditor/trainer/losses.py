@@ -3,28 +3,44 @@ import torch.nn.functional as F
 
 
 def kl_loc_loss(pre, post, mask=None):
+    # Keep logits in their native dtype until bounded chunks are processed.
+    # Casting the complete LLaVA-OV vocabulary tensor to fp32 first can
+    # allocate >1 GiB while MEND retains the inner computation graph.
+    sequence = pre.dim() == 3
+    if sequence:
+        if pre.shape[-1] <= 1:
+            raise NotImplementedError
+        if mask is None:
+            raise AssertionError("sequence KL locality requires a mask")
+        pre_ = pre.contiguous().view(-1, pre.shape[-1])
+        post_ = post.contiguous().view(-1, post.shape[-1])
+        assert pre_.shape == post_.shape
+        mask_ = mask.view(pre_.shape[0])
+        denom = mask_.sum()
+        if denom == 0:
+            raise ValueError("KL locality mask is empty")
+        total = torch.zeros((), device=pre.device, dtype=torch.float32)
+        chunk_size = 128
+        for start in range(0, pre_.shape[0], chunk_size):
+            stop = min(start + chunk_size, pre_.shape[0])
+            pre_chunk = pre_[start:stop].float()
+            post_chunk = post_[start:stop].float()
+            kl = (
+                pre_chunk.softmax(-1)
+                * (pre_chunk.log_softmax(-1) - post_chunk.log_softmax(-1))
+            ).sum(-1)
+            total = total + (kl * mask_[start:stop].float()).sum()
+        return total / denom.float()
+
     pre = pre.to(torch.float32)
     post = post.to(torch.float32)
-
-    sequence = pre.dim() == 3
     pre_ = pre.contiguous().view(-1, pre.shape[-1])
     post_ = post.contiguous().view(pre_.shape)
     assert pre_.shape[0] == post_.shape[0]
-
-    if not sequence:
-        if pre_.shape[-1] == 1:  # No masking needed for binary classification
-            return (pre.sigmoid() * (F.logsigmoid(pre) - F.logsigmoid(post))).mean() + (
-                (-pre).sigmoid() * (F.logsigmoid(-pre) - F.logsigmoid(-post))
-            ).mean()
-    else:  # We have sequences of predictions; masking needed
-        if pre_.shape[-1] > 1:
-            assert mask is not None
-            mask_ = mask.view(pre_.shape[0])
-            kl = (
-                pre_.softmax(-1) * (pre_.log_softmax(-1) - post_.log_softmax(-1))
-            ).sum(-1)
-            return (kl * mask_).sum() / mask_.sum()
-
+    if pre_.shape[-1] == 1:
+        return (pre.sigmoid() * (F.logsigmoid(pre) - F.logsigmoid(post))).mean() + (
+            (-pre).sigmoid() * (F.logsigmoid(-pre) - F.logsigmoid(-post))
+        ).mean()
     raise NotImplementedError
 
 
@@ -55,7 +71,9 @@ def mask_hf_labels(labels, null_token=0):
 def multiclass_log_probs(config, pred, targ, shift=False, eps=torch.finfo(torch.float32).eps, exact_match=False, **kwargs):
     NULL_TOKEN = 0  # a placeholder used for masked target locations
 
-    pred = pred.clone()
+    # `pred` is read-only below. Cloning the complete [batch, sequence,
+    # vocabulary] tensor can cost multiple GiB for LLaVA-OV and OOM during
+    # validation while a MEND checkpoint graph is resident.
     targ = targ.clone()
     if shift and pred.dim() == 3:  # Dealing with sequences
         pred = pred[:, :-1]  # Remove last prediction in sequence
@@ -67,7 +85,21 @@ def multiclass_log_probs(config, pred, targ, shift=False, eps=torch.finfo(torch.
 
     mask = targ != -100
     targ[~mask] = NULL_TOKEN  # Can be any valid token, since we'll throw them out
-    unmasked_log_probs = pred.log_softmax(-1).gather(-1, targ.unsqueeze(-1)).squeeze(-1)
+    # Compute only the target-token log probabilities in bounded chunks.  A
+    # full-vocabulary fp32 log_softmax is prohibitively large for LLaVA-OV
+    # while MEND retains the inner graph.
+    flat_pred = pred.reshape(-1, pred.shape[-1])
+    flat_targ = targ.reshape(-1)
+    flat_selected = []
+    chunk_size = 128
+    for start in range(0, flat_pred.shape[0], chunk_size):
+        stop = min(start + chunk_size, flat_pred.shape[0])
+        flat_selected.append(
+            flat_pred[start:stop].float().log_softmax(-1).gather(
+                -1, flat_targ[start:stop].unsqueeze(-1)
+            ).squeeze(-1)
+        )
+    unmasked_log_probs = torch.cat(flat_selected).view_as(targ)
     
     # debug
     # print(pred.shape, targ.shape)

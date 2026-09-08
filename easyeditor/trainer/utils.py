@@ -161,7 +161,7 @@ def load_archive(path):
         path = os.path.join(models_dir, non_bk[0])
 
     LOG.info(f"Loading checkpoint from {path}")
-    archive = torch.load(path, map_location="cpu")
+    archive = torch.load(path, map_location="cpu", weights_only=False)
     LOG.info("Load complete.")
 
     return archive, path

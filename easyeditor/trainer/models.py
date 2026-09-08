@@ -106,6 +106,65 @@ def get_model(config):
             torch_dtype=config.dtype,
             # attn_implementation="flash_attention_2" 
         )
+        # The vision tower in transformers 4.57.1 does not return hidden_states
+        # even when output_hidden_states=True.  Monkey-patch get_image_features
+        # to fall back to last_hidden_state (the -1 layer) when hidden_states is
+        # None, which covers the default vision_feature_layer=-1 case.
+        from transformers.models.llava_onevision.modeling_llava_onevision import (
+            image_size_to_num_patches,
+        )
+        _orig_get_image_features = model.model.get_image_features
+        def _patched_get_image_features(self, pixel_values, image_sizes, **kw):
+            # Siglip vision tower in transformers 4.57.1 does not return
+            # hidden_states, so always use the last_hidden_state fallback.
+            vision_feature_layer = kw.get("vision_feature_layer", self.config.vision_feature_layer)
+            if not (isinstance(vision_feature_layer, int) and vision_feature_layer in (-1, 0)):
+                raise RuntimeError(
+                    "Siglip vision tower does not return hidden_states; "
+                    f"cannot select layer {vision_feature_layer}"
+                )
+            vision_feature_select_strategy = kw.get(
+                "vision_feature_select_strategy", self.config.vision_feature_select_strategy
+            )
+            vision_aspect_ratio = kw.get("vision_aspect_ratio", self.config.vision_aspect_ratio)
+            batch_num_images = kw.get("batch_num_images", None)
+            # Infer image_num_patches from image_sizes (same logic as original)
+            if batch_num_images is None:
+                need_patching = [True] * len(image_sizes)
+            else:
+                need_patching = [n == 1 for n in batch_num_images for _ in range(n)]
+            image_num_patches = [
+                image_size_to_num_patches(
+                    image_size=imsize,
+                    grid_pinpoints=self.config.image_grid_pinpoints,
+                    patch_size=self.config.vision_config.image_size,
+                )
+                if should_patch
+                else 1
+                for imsize, should_patch in zip(image_sizes, need_patching)
+            ]
+            # Handle stacked 5D pixel_values
+            if pixel_values.dim() == 5:
+                _pixel_values_list = [
+                    pix_val[:num_patch]
+                    for pix_val, num_patch in zip(pixel_values, image_num_patches)
+                ]
+                pixel_values = torch.cat(_pixel_values_list, dim=0)
+            elif pixel_values.dim() != 4:
+                raise ValueError(f"pixel_values shape {pixel_values.shape}")
+            tower_out = self.vision_tower(pixel_values, output_hidden_states=True)
+            selected = tower_out.last_hidden_state
+            if vision_feature_select_strategy == "default":
+                selected = selected[:, 1:]
+            projected = self.multi_modal_projector(selected)
+            split = torch.split(projected, image_num_patches, dim=0)
+            image_features, _ = self.pack_image_features(
+                split, image_sizes, image_newline=self.image_newline,
+                vision_aspect_ratio=vision_aspect_ratio,
+            )
+            return image_features
+        import types
+        model.model.get_image_features = types.MethodType(_patched_get_image_features, model.model)
         # for name, param in model.named_parameters():
         #     print(f"{name}: {param.shape}")
 

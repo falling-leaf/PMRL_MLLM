@@ -1,18 +1,18 @@
 # Model
 device: 0
 
-name: hugging_cache/qwen2-vl-7b
-model_name: qwen2-vl-7b
+name: /root/hugging_cache/Qwen2-VL-7B-Instruct
+model_name: qwen2-vl
 model_class: qwen2-vl-7b
 tokenizer_class: .
 tokenizer_name: .
 inner_params:
-- model.layers.25.mlp.up_proj.weight
-- model.layers.25.mlp.down_proj.weight
-- model.layers.26.mlp.up_proj.weight
-- model.layers.26.mlp.down_proj.weight
-- model.layers.27.mlp.up_proj.weight
-- model.layers.27.mlp.down_proj.weight
+- model.language_model.layers.25.mlp.up_proj.weight
+- model.language_model.layers.25.mlp.down_proj.weight
+- model.language_model.layers.26.mlp.up_proj.weight
+- model.language_model.layers.26.mlp.down_proj.weight
+- model.language_model.layers.27.mlp.up_proj.weight
+- model.language_model.layers.27.mlp.down_proj.weight
 
 # Method
 alg: MEND
@@ -56,7 +56,7 @@ early_stop_key: "loss/total_edit_val"
 eval_only: False
 half: False
 debug: False
-save: False
+save: True
 verbose: True
 
 val_batch_size: 1
@@ -66,7 +66,7 @@ opt: Adam
 grad_clip: 100.
 
 # Output
-results_dir: ./results
+results_dir: ./results/MEND_QWEN2VL_BASELINE_META_TRAIN
 
 # Multimodal
 exact_match: True
@@ -74,5 +74,20 @@ qformer_checkpoint: .
 qformer_name_or_path: .
 state_dict_file: .
 # image
-coco_image: ../
-rephrase_image: ../
+coco_image: /root/MMEdit/images
+rephrase_image: /root/MMEdit/images
+
+# MEND baseline mode
+using_extra: false
+using_lap: false
+using_pmrl: false
+using_image_embedding: true
+num_rephrase: 5
+lap_epsilon: 0.001
+pmrl_tau_alignment: 0.05
+pmrl_tau_regularization: 0.1
+pmrl_alignment_weight: 1.0
+pmrl_regularization_weight: 0.1
+pmrl_scale: 1.0
+mend_log_grad_diagnostics: false
+checkpoint_before_validation: true

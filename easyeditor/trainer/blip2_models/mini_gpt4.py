@@ -306,6 +306,24 @@ class MiniGPT4(Blip2Base):
             attention_mask = to_regress_tokens.attention_mask
         return inputs_embeds, attention_mask, targets
 
+    def image_encoding(self, samples):
+        """Compatibility seam for singleton editing methods that perturb fused inputs."""
+        return self.text_encoding(samples)
+
+    def LLM_forward(self, inputs_embeds, attention_mask, targets, using_dropout=False):
+        outputs = self.llama_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True,
+            labels=targets,
+        )
+        return MiniGPTOutput(
+            loss=outputs.loss,
+            logits=outputs.logits,
+            labels=targets,
+            attention_mask=attention_mask,
+        ), None
+
     def forward(self, samples):
         if isinstance(samples, (list, tuple)):
             inputs_embeds, attention_mask, targets = [], [], []

@@ -1,18 +1,15 @@
+# LLaVA-OV (Qwen2-7B) MEND meta-training baseline for IC — full training.
 # Model
 device: 0
-
-name: hugging_cache/llava-onevision-qwen2-7b-ov-hf
+name: /root/hugging_cache/llava-onevision-qwen2-7b-ov-hf
 model_name: llava-onevision
 model_class: llava-onevision
 tokenizer_class: .
 tokenizer_name: .
+dtype: torch.bfloat16
 inner_params:
-- language_model.model.layers.25.mlp.up_proj.weight
-- language_model.model.layers.25.mlp.down_proj.weight
-- language_model.model.layers.26.mlp.up_proj.weight
-- language_model.model.layers.26.mlp.down_proj.weight
-- language_model.model.layers.27.mlp.up_proj.weight
-- language_model.model.layers.27.mlp.down_proj.weight
+- model.language_model.layers.27.mlp.up_proj.weight
+- model.language_model.layers.27.mlp.down_proj.weight
 
 # Method
 alg: MEND
@@ -41,11 +38,10 @@ mlp_class: IDMLP
 shared: True
 archive: null
 
-# Train
+# Train — full 30k iterations
 batch_size: 1
 model_save_pt: 5000
 silent: False
-#max_epochs: 1
 max_iters: 30000
 log_interval: 200
 eval_log_interval: 5000
@@ -56,23 +52,37 @@ early_stop_key: "loss/total_edit_val"
 eval_only: False
 half: False
 debug: False
-save: False
+save: True
 verbose: True
 
 val_batch_size: 1
 accumulate_bs: 2
-val_steps: 500 # only for debug
+val_steps: 100
 opt: Adam
 grad_clip: 100.
 
 # Output
-results_dir: ./results
+results_dir: ./results/MEND_LLAVAOV_BASELINE_META_TRAIN
 
 # Multimodal
 exact_match: True
 qformer_checkpoint: .
 qformer_name_or_path: .
 state_dict_file: .
-# image
-coco_image: ../
-rephrase_image: ../
+coco_image: /root/MMEdit/images
+rephrase_image: /root/MMEdit/images
+
+# MEND baseline mode
+using_extra: false
+using_lap: false
+using_pmrl: false
+using_image_embedding: true
+num_rephrase: 5
+lap_epsilon: 0.001
+pmrl_tau_alignment: 0.05
+pmrl_tau_regularization: 0.1
+pmrl_alignment_weight: 1.0
+pmrl_regularization_weight: 0.1
+pmrl_scale: 1.0
+mend_log_grad_diagnostics: false
+checkpoint_before_validation: true

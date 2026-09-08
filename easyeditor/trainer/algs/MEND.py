@@ -26,6 +26,29 @@ from ..utils import _inner_params, _logits
 LOG = logging.getLogger(__name__)
 
 
+class _FunctionalModel(nn.Module):
+    """Run a module with differentiable fast weights without copying them.
+
+    ``higher.monkeypatch(..., in_place=True)`` registers updated non-leaf fast
+    weights as ``nn.Parameter`` objects while functionalizing large HF models.
+    That registration detaches them from the MEND transform graph.  PyTorch's
+    functional call substitutes tensors only for the duration of ``forward``,
+    preserving their grad_fn and leaving the base model untouched.
+    """
+
+    def __init__(self, model, fast_params):
+        super().__init__()
+        # Do not register the 7B base model or non-leaf fast tensors as this
+        # temporary wrapper's parameters.
+        object.__setattr__(self, "_model", model)
+        object.__setattr__(self, "_fast_params", dict(fast_params))
+
+    def forward(self, *args, **kwargs):
+        return torch.func.functional_call(
+            self._model, self._fast_params, args=args, kwargs=kwargs, strict=False
+        )
+
+
 def update_counter(x, m, s, k):
     new_m = m + (x - m) / k
     new_s = s + (x - m) * (x - new_m)
@@ -138,17 +161,18 @@ class GradientTransform(nn.Module):
                         v_[idx], self.v_mean, self.v_s, self.k
                     )
 
-            if self.k < 2:
-                raise RuntimeError(
-                    f"Can't perform normalization with only {self.k} samples so far"
-                )
-            self.u_std = (self.u_s / (self.k - 1)) ** 0.5
-            self.v_std = (self.v_s / (self.k - 1)) ** 0.5
+            if self.cfg.norm and self.k >= 2:
+                self.u_std = (self.u_s / (self.k - 1)) ** 0.5
+                self.v_std = (self.v_s / (self.k - 1)) ** 0.5
 
-        if self.cfg.norm:
+        if self.cfg.norm and self.k >= 2:
             u_input = (u_ - self.u_mean) / (self.u_std + 1e-7)
             v_input = (v_ - self.v_mean) / (self.v_std + 1e-7)
         else:
+            # A singleton multimodal edit can provide only one non-zero
+            # activation/gradient pair.  Online normalization is undefined
+            # until a second sample exists; use the raw pair for this first
+            # update instead of aborting the run or feeding NaNs.
             u_input = u_
             v_input = v_
 
@@ -179,8 +203,13 @@ class MEND(EditableModel):
 
         for n, p in model.named_parameters():
             if n not in self.config.inner_params:
-                p.requires_grad = False
-            else: break # 因为其到末尾的计算图是需要保存的，这里由于编辑的都是最后几层，因此并不影响
+                # Fast weights produced by MEND are non-leaf tensors. Their
+                # requires_grad flag cannot be mutated; they already inherit
+                # the correct graph from the functionalized model.
+                if p.is_leaf:
+                    p.requires_grad = False
+            else:
+                break # 因为其到末尾的计算图是需要保存的，这里由于编辑的都是最后几层，因此并不影响
 
         if edit_lrs is None:
             edit_lrs = nn.Parameter(
@@ -262,7 +291,11 @@ class MEND(EditableModel):
         if 'minigpt4' in self.config.model_name.lower() or 'blip' in self.config.model_name.lower():
             outputs = self.model(*inputs, **kwargs)
         elif "llava-onevision" in self.config.model_name.lower() or "qwen2-vl" in self.config.model_name.lower():
-            multimodal_inputs = inputs[0]
+            multimodal_inputs = dict(inputs[0]) if inputs else dict(kwargs)
+            # Do not ask Transformers to materialize the full-vocabulary CE
+            # tensor on auxiliary MEND forwards. Losses are computed by the
+            # bounded helpers below using the batch labels.
+            multimodal_inputs.pop("labels", None)
             outputs = self.model(**multimodal_inputs)
         elif 'gpt' in self.config.model_name.lower():
             outputs = _logits(self.model(input_ids=kwargs['input_ids'], attention_mask=kwargs['attention_mask']))
@@ -289,7 +322,132 @@ class MEND(EditableModel):
     def outer_parameters(self):
         return list(self.mend.parameters()) + [self.edit_lrs]
 
+    @staticmethod
+    def _hf_target_loss(logits, labels, reduction="mean"):
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        selected = shift_labels.ne(-100)
+        if not selected.any():
+            raise RuntimeError("MEND LAP batch has no supervised target tokens")
+        return F.cross_entropy(
+            shift_logits[selected], shift_labels[selected], reduction=reduction
+        )
+
+    def _compute_hf_lap_pmrl_loss(self, batch, base_hidden):
+        """LAP+PMRL inner-loss augmentation for HF multimodal MEND.
+
+        This intentionally augments the *inner* loss before MEND reads hook
+        deltas, so the learned gradient transform is trained and applied from
+        the same enhanced edit gradient.  It has no filesystem side effects.
+        """
+        # Both supported HF multimodal families expose their fusion helpers on
+        # the inner model, but Qwen2-VL and LLaVA-OneVision use different image
+        # metadata and positional-encoding APIs.
+        core = self.model.model
+        input_ids, labels = batch["input_ids"], batch["labels"]
+        text_embeds = core.get_input_embeddings()(input_ids)
+        if "llava-onevision" in self.config.model_name.lower():
+            image_features = core.get_image_features(
+                batch["pixel_values"], batch["image_sizes"],
+                batch_num_images=batch.get("batch_num_images"),
+            )
+            if isinstance(image_features, (tuple, list)):
+                image_features = torch.cat(image_features, dim=0)
+            image_mask, _ = core.get_placeholder_mask(
+                input_ids, inputs_embeds=text_embeds, image_features=image_features
+            )
+            fused = text_embeds.masked_scatter(image_mask, image_features)
+            # LLaVA-OneVision uses ordinary Qwen2 positions; the wrapper can
+            # derive them from attention_mask when input_ids is omitted.
+            forward_kwargs = dict(
+                attention_mask=batch["attention_mask"],
+                use_cache=False, return_dict=True, output_hidden_states=True,
+            )
+        else:
+            image_features = torch.cat(core.get_image_features(
+                batch["pixel_values"], batch.get("image_grid_thw")
+            ), dim=0).to(text_embeds.device, text_embeds.dtype)
+            image_mask, _ = core.get_placeholder_mask(
+                input_ids, inputs_embeds=text_embeds, image_features=image_features
+            )
+            fused = text_embeds.masked_scatter(image_mask, image_features)
+            position_ids, _ = core.get_rope_index(
+                input_ids, batch.get("image_grid_thw"), batch.get("video_grid_thw"),
+                batch["attention_mask"],
+            )
+            forward_kwargs = dict(
+                attention_mask=batch["attention_mask"], position_ids=position_ids,
+                use_cache=False, return_dict=True, output_hidden_states=True,
+            )
+        fused = fused.to(text_embeds.device, text_embeds.dtype)
+        # Do not let the probe's autograd pass populate MEND hook factors.
+        for module in self.model.modules():
+            module._mend_capture = False
+        probe = fused.detach().clone().requires_grad_(True)
+        probe_outputs = self.model(inputs_embeds=probe, **forward_kwargs)
+        probe_loss = self._hf_target_loss(probe_outputs.logits, labels, "sum")
+        grad = torch.autograd.grad(probe_loss, probe, retain_graph=False)[0]
+        for module in self.model.modules():
+            module._mend_capture = True
+        answer_mask = labels.ne(-100)
+        if getattr(self.config, "using_image_embedding", True):
+            perturb_mask = image_mask.any(dim=-1)
+        else:
+            perturb_mask = (~answer_mask) & batch["attention_mask"].bool()
+        if not perturb_mask.any():
+            raise RuntimeError("MEND LAP perturbation region is empty")
+        masked_grad = grad * perturb_mask.unsqueeze(-1).to(grad.dtype)
+        norm = masked_grad.float().flatten(1).norm(dim=1).clamp_min(1e-8)
+        direction = masked_grad / norm.to(grad.dtype).view(-1, 1, 1)
+        views = [base_hidden]
+        variant_losses = []
+        n_views = int(self.config.num_rephrase)
+        epsilon = float(self.config.lap_epsilon)
+        for idx in range(n_views):
+            delta = direction.detach() * (epsilon * float(idx + 1) / n_views)
+            out = self.model(inputs_embeds=fused.detach() + delta, **forward_kwargs)
+            views.append(out.hidden_states[-1])
+            variant_losses.append(self._hf_target_loss(out.logits, labels))
+        flattened = [F.normalize(v.reshape(-1, v.size(-1)).float(), dim=-1) for v in views]
+        if len({tuple(v.shape) for v in flattened}) != 1:
+            raise RuntimeError("MEND LAP hidden-state view shapes differ")
+        anchor = flattened[0].detach()
+        alignment = torch.stack([1 - (anchor * v).sum(-1).mean() for v in flattened[1:]]).mean()
+        consensus = F.normalize(torch.stack(flattened, dim=1).mean(dim=1), dim=-1)
+        logits = consensus @ consensus.T / float(self.config.pmrl_tau_regularization)
+        target = torch.arange(logits.size(0), device=logits.device)
+        regularization = F.cross_entropy(logits, target)
+        pmrl = (
+            float(self.config.pmrl_alignment_weight) * alignment / float(self.config.pmrl_tau_alignment)
+            + float(self.config.pmrl_regularization_weight) * regularization
+        ) * float(self.config.pmrl_scale)
+        if not torch.isfinite(pmrl):
+            raise FloatingPointError("MEND PMRL loss is non-finite")
+        return pmrl + torch.stack(variant_losses).mean() * float(
+            getattr(self.config, "lar_target_loss_weight", 0.0)
+        )
+
+    def _maybe_mend_extra_loss(self, batch, base_hidden):
+        if not (
+            getattr(self.config, "using_extra", False)
+            and getattr(self.config, "using_lap", False)
+            and getattr(self.config, "using_pmrl", False)
+        ):
+            return base_hidden.new_zeros(())
+        if (
+            "qwen2-vl" not in self.config.model_name.lower()
+            and "llava-onevision" not in self.config.model_name.lower()
+        ):
+            raise NotImplementedError(
+                "MEND LAP+PMRL currently supports Qwen2-VL and LLaVA-OneVision"
+            )
+        return self._compute_hf_lap_pmrl_loss(batch, base_hidden)
+
     def edit(self, batch, condition=None, detach_history=False, return_factors=False, **kwargs):
+        # Remove stale hook state from trainer pre-edit locality forwards.
+        for _, p in _inner_params(self.model.named_parameters(), self.config.inner_params):
+            p.__mend_x_stack__ = []
+            p.__mend_pairs__ = []
         if 'minigpt4' in self.config.model_name.lower() or 'blip' in self.config.model_name.lower():
             outputs = self.model(batch)        
             if not isinstance(outputs, torch.Tensor):
@@ -299,8 +457,17 @@ class MEND(EditableModel):
                 batch_labels = batch['labels']
             loss = self.edit_loss_fn(self.config, outputs, batch_labels, multimodal=True)["nll"]          
         elif "llava-onevision" in self.config.model_name.lower() or "qwen2-vl" in self.config.model_name.lower():
-            outputs = self.model(**batch)
-            loss = outputs.loss
+            extra_enabled = (
+                getattr(self.config, "using_extra", False)
+                and getattr(self.config, "using_lap", False)
+                and getattr(self.config, "using_pmrl", False)
+            )
+            model_inputs = dict(batch)
+            model_inputs.pop("labels", None)
+            outputs = self.model(**model_inputs, output_hidden_states=extra_enabled)
+            loss = self._hf_target_loss(outputs.logits, batch["labels"])
+            if extra_enabled:
+                loss = loss + self._maybe_mend_extra_loss(batch, outputs.hidden_states[-1])
             outputs = outputs.logits
         elif 'gpt' in self.config.model_name.lower():
             outputs = _logits(self.model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask']))
@@ -347,6 +514,15 @@ class MEND(EditableModel):
 
         loss.backward()
 
+        def captured_factors(p):
+            pairs = getattr(p, "__mend_pairs__", [])
+            if pairs:
+                return (
+                    torch.cat([x.reshape(-1, x.shape[-1]) for x, _ in pairs], dim=0),
+                    torch.cat([d.reshape(-1, d.shape[-1]) for _, d in pairs], dim=0),
+                )
+            return p.__x__, p.__delta__
+
         if self.config.shared:
             param_idx = (
                 lambda n, p: self.shape_dict[self.get_shape(p)].index(n)
@@ -355,7 +531,7 @@ class MEND(EditableModel):
             )  # noqa: E731
             transformed_factors = {
                 n: self.mend[str(tuple(self.get_shape(p)))](
-                    p.__x__, p.__delta__, param_idx(n, p)
+                    *captured_factors(p), param_idx(n, p)
                 )
                 for n, p in _inner_params(
                     self.model.named_parameters(), self.config.inner_params
@@ -363,7 +539,9 @@ class MEND(EditableModel):
             }
         else:
             transformed_factors = {
-                n: self.mend[n.replace(".", "#")](p.__x__, p.__delta__)
+                n: self.mend[n.replace(".", "#")](
+                    *captured_factors(p)
+                )
                 for n, p in _inner_params(
                     self.model.named_parameters(), self.config.inner_params
                 )
@@ -380,58 +558,90 @@ class MEND(EditableModel):
         }
 
         info_dict = {}
+        if getattr(self.config, "mend_log_grad_diagnostics", False):
+            # Cheap connectivity diagnostics; full weight diagnostics can OOM.
+            info_dict["diag/update_requires_grad"] = float(
+                all(g.requires_grad for g in mean_grads.values())
+            )
+            info_dict["diag/update_grad_fn"] = float(
+                all(g.grad_fn is not None for g in mean_grads.values())
+            )
+            info_dict["diag/pseudo_norm"] = float(
+                sum(g.float().norm().item() for g in mean_grads.values())
+            )
         if return_factors:
             info_dict["factors"] = transformed_factors
-        idx = 0
-        for n, p in _inner_params(
-            self.model.named_parameters(), self.config.inner_params
-        ):
-            info_dict[f"grad/true_mag{idx}"] = p.grad.norm(2).item()
-            info_dict[f"grad/pseudo_mag{idx}"] = mean_grads[n].norm(2).item()
-            info_dict[f"grad/true_std{idx}"] = p.grad.std().item()
-            info_dict[f"grad/pseudo_std{idx}"] = mean_grads[n].std().item()
-            info_dict[f"grad/diff{idx}"] = (p.grad - mean_grads[n]).norm(2).item()
-            info_dict[f"grad/cos{idx}"] = F.cosine_similarity(
-                p.grad.reshape(-1), mean_grads[n].reshape(-1), dim=0
-            ).item()
-            idx += 1
+        # Full 3.5B-parameter cosine/difference diagnostics allocate another
+        # weight-sized temporary tensor. They are not part of optimization and
+        # caused final validation OOM on a 48GB Qwen2-VL run.
+        if getattr(self.config, "mend_log_grad_diagnostics", False):
+            idx = 0
+            for n, p in _inner_params(
+                self.model.named_parameters(), self.config.inner_params
+            ):
+                info_dict[f"grad/true_mag{idx}"] = p.grad.norm(2).item()
+                info_dict[f"grad/pseudo_mag{idx}"] = mean_grads[n].norm(2).item()
+                info_dict[f"grad/true_std{idx}"] = p.grad.std().item()
+                info_dict[f"grad/pseudo_std{idx}"] = mean_grads[n].std().item()
+                info_dict[f"grad/diff{idx}"] = (p.grad - mean_grads[n]).norm(2).item()
+                info_dict[f"grad/cos{idx}"] = F.cosine_similarity(
+                    p.grad.reshape(-1), mean_grads[n].reshape(-1), dim=0
+                ).item()
+                idx += 1
 
         self.model.zero_grad()
 
         assert len(self.edit_lrs) == len(list(mean_grads.items()))
         updates = {n: lr * g for lr, (n, g) in zip(self.edit_lrs, mean_grads.items())}
 
-        edited_model = self.model
-        if not isinstance(edited_model, higher.patch._MonkeyPatchBase):
+        # HF multimodal models must keep the update tensors themselves in the
+        # post-edit graph. Registering them on a monkey-patched nn.Module turns
+        # the non-leaf tensors into detached Parameters and silently yields no
+        # MEND outer gradients.
+        if "llava-onevision" in self.config.model_name.lower() or "qwen2-vl" in self.config.model_name.lower():
+            fast_params = {}
+            for n, p in self.model.named_parameters():
+                fast_params[n] = p + updates[n].to(p.dtype) if n in pset else p
+            base_model = _FunctionalModel(self.model, fast_params)
+            diagnostic_params = fast_params.values()
+        else:
+            base_model = self.model
             if 'minigpt4' in self.config.model_name.lower() or 'blip' in self.config.model_name.lower():
-                edited_model = _make_functional(edited_model, in_place=True)
+                base_model = _make_functional(base_model, in_place=True)
             else:
-                edited_model = monkeypatch(edited_model, in_place=True)
+                base_model = monkeypatch(base_model, in_place=True)
+            new_params = []
+            for n, p in base_model.named_parameters():
+                mend_name = n if n in pset else f"model.{n}"
+                new_params.append(p + updates[mend_name].to(p.dtype) if mend_name in pset else p)
+            base_model.update_params(new_params)
+            diagnostic_params = new_params
 
-        new_params = []
-        for n, p in edited_model.named_parameters():
-            if n in pset:
-                new_params.append(p + updates[n].to(p.dtype))
-            else:
-                new_params.append(p)
-
-        edited_model.update_params(new_params)
-
-        if detach_history:
-            new_model = self.model_constructor()
-            new_model.load_state_dict(edited_model.state_dict())
-            edited_model = new_model
-
-        return (
-            MEND(
-                edited_model,
-                self.config,
-                self.model_constructor,
-                self.mend,
-                edit_lrs=self.edit_lrs,
-            ),
-            info_dict,
+        if getattr(self.config, "mend_log_grad_diagnostics", False):
+            info_dict["diag/fast_param_grad_fn"] = float(
+                any(p.grad_fn is not None for p in diagnostic_params if torch.is_tensor(p))
+            )
+        # Keep a dict-aware MEND wrapper around the functional HF model. Build
+        # it through EditableModel only (no hooks/parameter reinitialization),
+        # then attach the shared transform and learning-rate parameters.
+        edited_model = object.__new__(MEND)
+        nn.Module.__init__(edited_model)
+        EditableModel.__init__(
+            edited_model, base_model, self.config, self.model_constructor
         )
+        # Keep all original MEND hooks on the functional model. They must
+        # capture the post-edit factors only for a subsequent edit; removing
+        # them here also removes the module identity used by the meta-graph.
+        edited_model.model.handles = getattr(self.model, "handles", [])
+        edited_model.mend = self.mend
+        edited_model.edit_lrs = self.edit_lrs
+        edited_model.shape_dict = self.shape_dict
+        if getattr(self.config, "mend_log_grad_diagnostics", False):
+            info_dict["diag/shared_mend"] = 1.0
+            info_dict["diag/mend_requires_grad"] = float(
+                next(self.mend.parameters()).requires_grad
+            )
+        return edited_model, info_dict
 
 
 if __name__ == "__main__":
