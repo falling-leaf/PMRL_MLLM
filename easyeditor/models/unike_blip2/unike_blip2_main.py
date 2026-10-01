@@ -23,6 +23,7 @@ from torch.nn import functional as F
 
 from ..wise.utils import brackets_to_periods, parent_module, blip2_multimodal_tokenize
 from ..transformer_patcher.layers import ExpandedLinearInput, ExpandedLinearOutput
+from ...util.pmrl_utils import apply_asam_deltas, asam_parameter_deltas, request_gen_views
 
 
 def _target_loss(outputs):
@@ -162,76 +163,77 @@ class UniKEBLIP2(torch.nn.Module):
 
     def forward(self, *args, **kwargs): return self.model(*args, **kwargs)
 
-    def _asam_loss(self, edit_inputs, locality_inputs):
-        """One ASAM perturb-and-evaluate term over the added UniKE path.
+    def _trainable_parameters(self):
+        return [p for p in self.parameters() if p.requires_grad]
 
-        The perturbation is applied only to trainable added key/value parameters;
-        frozen base weights and retrieval memories are untouched.
-        """
-        trainable = [p for p in self.parameters() if p.requires_grad]
-        grads = torch.autograd.grad(self._base_loss(edit_inputs, locality_inputs), trainable, create_graph=False, allow_unused=True)
-        # ASAM: maximize in a parameter-scale-aware neighborhood.  The frozen
-        # backbone is excluded; only added UniKE key/value parameters move.
-        scaled = [parameter.detach().abs() * gradient.float() for parameter, gradient in zip(trainable, grads) if gradient is not None]
-        norm = torch.sqrt(torch.stack([item.pow(2).sum() for item in scaled]).sum()).clamp_min(1e-12)
-        epsilon = float(self.config.asam_epsilon)
-        perturbations = []
-        with torch.no_grad():
-            for parameter, gradient in zip(trainable, grads):
-                if gradient is None:
-                    perturbations.append(None)
-                    continue
-                scale = parameter.detach().abs() + 1e-2
-                delta = epsilon * scale * scale * gradient.float() / norm
-                if parameter.dtype != delta.dtype:
-                    delta = delta.to(parameter.dtype)
-                parameter.add_(delta)
-                perturbations.append(delta)
+    def _frozen_locality_logits(self, locality_inputs):
+        """Teacher logits from the original FFNs, without UniKE expansion or shift."""
+        handles = list(self.handles)
+        for handle in handles:
+            handle.remove()
+        self.handles.clear()
+        for p1, c1, o1, _e1, p2, c2, o2, _e2 in self.entries:
+            setattr(p1, c1, o1)
+            setattr(p2, c2, o2)
         try:
-            return self._base_loss(edit_inputs, locality_inputs), perturbations
-        except Exception:
             with torch.no_grad():
-                for parameter, delta in zip(trainable, perturbations):
-                    if delta is not None:
-                        parameter.sub_(delta)
-            raise
+                return self.model(locality_inputs).logits.detach()
+        finally:
+            self._reinstall_expanded_layers()
+            self._reinstall_hooks()
 
-    def _base_loss(self, edit_inputs, locality_inputs):
+    def _base_loss(self, edit_inputs, locality_inputs, frozen_locality_logits, extra_reliability=None):
         reliability = _target_loss(self.model(edit_inputs))
-        with torch.no_grad():
-            base = self.model(locality_inputs).logits.detach()
+        if extra_reliability:
+            for extra_inputs, weight in extra_reliability:
+                reliability = reliability + float(weight) * _target_loss(self.model(extra_inputs))
         post = self.model(locality_inputs).logits
-        length = min(base.size(1), post.size(1))
-        locality = F.kl_div(F.log_softmax(post[:, -length:], dim=-1), F.softmax(base[:, -length:], dim=-1), reduction="batchmean")
+        length = min(frozen_locality_logits.size(1), post.size(1))
+        locality = F.kl_div(
+            F.log_softmax(post[:, -length:].float(), dim=-1),
+            F.softmax(frozen_locality_logits[:, -length:].float(), dim=-1),
+            reduction="batchmean",
+        )
         return reliability + float(self.config.locality_weight) * locality
 
-    def edit(self, inputs):
+    def edit(self, inputs, extra_reliability=None):
         edit_inputs, locality_inputs = inputs
+        extra_reliability = extra_reliability or []
         params = []
         for _p1, _c1, _o1, e1, _p2, _c2, _o2, e2 in self.entries:
             params += list(e1.extra_output.parameters()) + list(e2.extra_input.parameters())
         optimizer = torch.optim.Adam(
             params, lr=float(self.config.edit_lr), eps=float(getattr(self.config, "adam_eps", 1e-4))
         )
+        frozen_locality_logits = self._frozen_locality_logits(locality_inputs)
         for step in range(int(self.config.n_iter)):
             optimizer.zero_grad(set_to_none=True)
-            base_loss = self._base_loss(edit_inputs, locality_inputs)
+            base_loss = self._base_loss(edit_inputs, locality_inputs, frozen_locality_logits, extra_reliability)
             if not torch.isfinite(base_loss):
                 raise FloatingPointError("UniKE BLIP-2 base loss is non-finite")
             base_loss.backward()
             loss = base_loss.detach()
             if bool(getattr(self.config, "using_asam", False)):
-                asam, perturbations = self._asam_loss(edit_inputs, locality_inputs)
-                if not torch.isfinite(asam):
-                    raise FloatingPointError("UniKE BLIP-2 ASAM loss is non-finite")
-                weighted_asam = float(self.config.asam_weight) * asam
-                weighted_asam.backward()
-                with torch.no_grad():
-                    for parameter, delta in zip([p for p in self.parameters() if p.requires_grad], perturbations):
-                        if delta is not None:
-                            parameter.sub_(delta)
-                loss = loss + weighted_asam.detach()
-                print(f"unike_asam_step={step} asam_loss={asam.detach()}")
+                trainable = self._trainable_parameters()
+                grads = [None if p.grad is None else p.grad.detach().clone() for p in trainable]
+                rho = float(getattr(self.config, "asam_scale_rho", 0.1))
+                perturbations = asam_parameter_deltas(
+                    trainable, grads, float(self.config.asam_epsilon), rho=rho
+                )
+                replace = bool(getattr(self.config, "asam_replace", True))
+                if replace:
+                    optimizer.zero_grad(set_to_none=True)
+                apply_asam_deltas(trainable, perturbations, sign=1.0)
+                try:
+                    asam = self._base_loss(edit_inputs, locality_inputs, frozen_locality_logits, extra_reliability)
+                    if not torch.isfinite(asam):
+                        raise FloatingPointError("UniKE BLIP-2 ASAM loss is non-finite")
+                    scale = 1.0 if replace else float(self.config.asam_weight)
+                    (scale * asam).backward()
+                    loss = asam.detach()
+                    print(f"unike_asam_step={step} asam_loss={asam.detach()}")
+                finally:
+                    apply_asam_deltas(trainable, perturbations, sign=-1.0)
             torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             optimizer.step()
             print(f"unike_step={step} total_loss={loss}")
@@ -254,8 +256,17 @@ def apply_unike_blip2_to_multimodal_model(model, tok, requests: List[Dict], hpar
     if copy: model = copy_module.deepcopy(model).to(f"cuda:{hparams.device}")
     editor = UniKEBLIP2(model, hparams, f"cuda:{hparams.device}")
     request = requests[0]
-    inputs, _, _, _, _ = blip2_multimodal_tokenize([request], processor=tok, device=f"cuda:{hparams.device}", context_templates=None, hparams=hparams)
+    device = f"cuda:{hparams.device}"
+    inputs, _, _, _, _ = blip2_multimodal_tokenize([request], processor=tok, device=device, context_templates=None, hparams=hparams)
+    extra = []
+    for view, weight in request_gen_views(
+        request,
+        getattr(hparams, "gen_weight", 0.0),
+        getattr(hparams, "image_gen_weight", 0.0),
+    ):
+        extra_inputs, _, _, _, _ = blip2_multimodal_tokenize([view], processor=tok, device=device, context_templates=None, hparams=hparams)
+        extra.append((extra_inputs[0], weight))
     editor.install_memory(inputs[0], int(kwargs.get("sample_id", 0)))
     print(f"Executing UniKE-BLIP2 ({editor.memory_mode}): [{request['prompt']}] -> [{request['target']}]")
-    editor.edit(inputs)
+    editor.edit(inputs, extra_reliability=extra)
     return editor, editor.reset_layer

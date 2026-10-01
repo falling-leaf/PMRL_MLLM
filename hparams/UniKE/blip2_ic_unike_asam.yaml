@@ -1,0 +1,42 @@
+alg_name: UniKE-BLIP2
+name: /root/hugging_cache/opt-2.7b
+model_name: blip2
+tokenizer_class: GPT2Tokenizer
+tokenizer_name: /root/hugging_cache/opt-2.7b
+device: 0
+dtype: torch.float32
+add_neuron_num: 10
+edit_lr: 0.0001
+n_iter: 20
+locality_weight: 1.0
+inner_params:
+  - opt_model.model.decoder.layers.23.fc1.weight
+  - opt_model.model.decoder.layers.23.fc2.weight
+l_ike_layers:
+  - opt_model.model.decoder.layers.20.mlp
+  - opt_model.model.decoder.layers.21.mlp
+  - opt_model.model.decoder.layers.22.mlp
+  - opt_model.model.decoder.layers.23.mlp
+retrieved_knowledge_path: null
+latent_ike_path: null
+semantic_encoder_path: null
+retrieval_top_k: 40
+feature_shift_scale: 1.0
+semantic_gate: true
+adam_eps: 0.0001
+using_asam: true
+asam_epsilon: 0.05
+asam_weight: 0.25
+asam_visual_only: true
+asam_scale_rho: 0.1
+sequential_edit: false
+model_parallel: false
+use_chat_template: false
+exact_match: true
+qformer_checkpoint: /root/hugging_cache/blip2_pretrained_opt2.7b.pth
+qformer_name_or_path: /root/hugging_cache/bert-base-uncased
+state_dict_file: /root/hugging_cache/eva_vit_g.pth
+pretrained_ckpt: null
+file_type: image
+coco_image: /root/MMEdit/images
+rephrase_image: /root/MMEdit/images

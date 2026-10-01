@@ -2,11 +2,136 @@ import torch
 import torch.nn.functional as F
 
 
-def kl_loc_loss(pre, post, mask=None):
-    # Keep logits in their native dtype until bounded chunks are processed.
-    # Casting the complete LLaVA-OV vocabulary tensor to fp32 first can
-    # allocate >1 GiB while MEND retains the inner computation graph.
-    sequence = pre.dim() == 3
+def hf_target_loss(logits, labels, attention_mask=None, reduction="mean", chunk_size=128):
+    """Compute causal CE only for supervised HF target tokens.
+
+    Multimodal batches contain long image-prefix sequences but usually only a
+    few answer tokens.  Selecting the valid shifted rows before softmax avoids
+    materialising a full-vocabulary fp32 loss tensor while keeping the same
+    ``logits[..., :-1]`` / ``labels[..., 1:]`` convention as Transformers.
+    """
+    if logits.ndim != 3 or labels.ndim != 2:
+        raise ValueError(
+            f"HF target loss expects logits [B,L,V] and labels [B,L], "
+            f"got {tuple(logits.shape)} and {tuple(labels.shape)}"
+        )
+    if logits.shape[:2] != labels.shape:
+        raise ValueError(
+            f"HF logits/labels sequence shapes differ: {tuple(logits.shape[:2])} "
+            f"vs {tuple(labels.shape)}"
+        )
+    if attention_mask is not None:
+        if attention_mask.shape != labels.shape:
+            raise ValueError(
+                f"HF attention mask shape {tuple(attention_mask.shape)} does not "
+                f"match labels {tuple(labels.shape)}"
+            )
+        valid = labels[:, 1:].ne(-100) & attention_mask[:, 1:].bool()
+    else:
+        valid = labels[:, 1:].ne(-100)
+    if not valid.any():
+        raise RuntimeError("HF batch has no supervised target tokens")
+
+    shift_logits = logits[:, :-1, :].reshape(-1, logits.shape[-1])
+    shift_labels = labels[:, 1:].reshape(-1)
+    valid = valid.reshape(-1)
+    selected_logits = shift_logits[valid]
+    selected_labels = shift_labels[valid]
+    if reduction == "none":
+        pieces = []
+        for start in range(0, selected_logits.shape[0], chunk_size):
+            stop = min(start + chunk_size, selected_logits.shape[0])
+            pieces.append(F.cross_entropy(
+                selected_logits[start:stop], selected_labels[start:stop], reduction="none"
+            ))
+        return torch.cat(pieces)
+    # A single selected-row CE is already bounded by the number of answer
+    # tokens; chunking here additionally bounds temporary fp32 softmax memory.
+    if reduction == "sum":
+        total = selected_logits.new_zeros((), dtype=torch.float32)
+        for start in range(0, selected_logits.shape[0], chunk_size):
+            stop = min(start + chunk_size, selected_logits.shape[0])
+            total = total + F.cross_entropy(
+                selected_logits[start:stop], selected_labels[start:stop], reduction="sum"
+            ).float()
+        return total
+    if reduction != "mean":
+        raise ValueError(f"Unsupported HF target-loss reduction: {reduction}")
+    return hf_target_loss(
+        logits, labels, attention_mask=attention_mask, reduction="sum", chunk_size=chunk_size
+    ) / valid.sum().to(torch.float32)
+
+
+class _ChunkedSequenceKLLoss(torch.autograd.Function):
+    """Sequence KL whose forward does not retain per-chunk softmax buffers.
+
+    The locality logits are very large (LLaVA-OV has a 152k vocabulary).  A
+    normal Python loop builds one autograd subgraph per row chunk and keeps all
+    of their log-softmax intermediates alive until the outer MEND backward.
+    The custom backward recomputes the closed-form gradient one chunk at a
+    time, retaining only the input logits and one bounded temporary.
+    """
+
+    @staticmethod
+    def forward(ctx, pre, post, mask, chunk_size):
+        if pre.shape != post.shape:
+            raise ValueError(f"KL logits differ: {pre.shape} vs {post.shape}")
+        if mask.ndim != 1 or mask.shape[0] != pre.shape[0]:
+            raise ValueError("KL mask must be flattened to the sequence rows")
+        if chunk_size < 1:
+            raise ValueError("KL chunk_size must be positive")
+        denom = mask.sum()
+        if int(denom.item()) == 0:
+            raise ValueError("KL locality mask is empty")
+        # Saving post is required for autograd's input identity, but no
+        # intermediate softmax/log-softmax buffers from the forward are saved.
+        ctx.save_for_backward(pre.detach(), post.detach(), mask)
+        ctx.chunk_size = int(chunk_size)
+        ctx.denom = denom
+        total = torch.zeros((), device=post.device, dtype=torch.float32)
+        for start in range(0, pre.shape[0], ctx.chunk_size):
+            stop = min(start + ctx.chunk_size, pre.shape[0])
+            pre_chunk = pre[start:stop].float()
+            post_chunk = post[start:stop].float()
+            kl = pre_chunk.softmax(-1) * (
+                pre_chunk.log_softmax(-1) - post_chunk.log_softmax(-1)
+            )
+            total = total + (kl.sum(-1) * mask[start:stop].float()).sum()
+        return total / denom.float()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        pre, post, mask = ctx.saved_tensors
+        # The gradient is consumed by autograd only with respect to post.  Form
+        # one bounded chunk at a time; accumulate into a flat CPU buffer so the
+        # GPU never needs a second full-vocabulary gradient allocation.
+        grad_post = torch.empty(post.shape, device="cpu", dtype=post.dtype, pin_memory=False)
+        denom = ctx.denom.to(torch.float32)
+        with torch.no_grad():
+            for start in range(0, post.shape[0], ctx.chunk_size):
+                stop = min(start + ctx.chunk_size, post.shape[0])
+                pre_chunk = pre[start:stop].float()
+                post_chunk = post[start:stop].float()
+                chunk_grad = post_chunk.softmax(-1) - pre_chunk.softmax(-1)
+                chunk_grad.mul_(mask[start:stop].float().unsqueeze(-1))
+                chunk_grad.div_(denom)
+                grad_post[start:stop].copy_(chunk_grad.to("cpu", dtype=post.dtype))
+                del pre_chunk, post_chunk, chunk_grad
+        # Returning a CPU tensor is not accepted for a CUDA input; transfer in
+        # bounded row chunks to avoid materialising the whole GPU gradient.
+        result = torch.empty_like(post)
+        for start in range(0, post.shape[0], ctx.chunk_size):
+            stop = min(start + ctx.chunk_size, post.shape[0])
+            result[start:stop].copy_(grad_post[start:stop].to(post.device))
+        del grad_post
+        return None, result * grad_output.to(post.dtype), None, None
+
+
+def kl_loc_loss(pre, post, mask=None, chunk_size=32):
+    # Keep the sequence KL's differentiable intermediates bounded.  The custom
+    # autograd path is mathematically identical to the chunked reference but
+    # does not retain one log-softmax graph per chunk until meta-backward.
+    sequence = pre.dim() in (2, 3)
     if sequence:
         if pre.shape[-1] <= 1:
             raise NotImplementedError
@@ -14,23 +139,10 @@ def kl_loc_loss(pre, post, mask=None):
             raise AssertionError("sequence KL locality requires a mask")
         pre_ = pre.contiguous().view(-1, pre.shape[-1])
         post_ = post.contiguous().view(-1, post.shape[-1])
-        assert pre_.shape == post_.shape
-        mask_ = mask.view(pre_.shape[0])
-        denom = mask_.sum()
-        if denom == 0:
-            raise ValueError("KL locality mask is empty")
-        total = torch.zeros((), device=pre.device, dtype=torch.float32)
-        chunk_size = 128
-        for start in range(0, pre_.shape[0], chunk_size):
-            stop = min(start + chunk_size, pre_.shape[0])
-            pre_chunk = pre_[start:stop].float()
-            post_chunk = post_[start:stop].float()
-            kl = (
-                pre_chunk.softmax(-1)
-                * (pre_chunk.log_softmax(-1) - post_chunk.log_softmax(-1))
-            ).sum(-1)
-            total = total + (kl * mask_[start:stop].float()).sum()
-        return total / denom.float()
+        mask_ = mask.reshape(-1).bool()
+        if mask_.shape[0] != pre_.shape[0]:
+            raise ValueError("KL mask does not match flattened sequence rows")
+        return _ChunkedSequenceKLLoss.apply(pre_, post_, mask_, int(chunk_size))
 
     pre = pre.to(torch.float32)
     post = post.to(torch.float32)
@@ -156,8 +268,8 @@ def multiclass_log_probs(config, pred, targ, shift=False, eps=torch.finfo(torch.
 
 
 def masked_log_probs(config, pred, targ, shift=False, exact_match=False, **kwargs):
-    pred = pred.to(torch.float32)
-
+    # Keep the large HF vocabulary tensor in native bf16; multiclass_log_probs
+    # casts only bounded target rows when it computes log-softmax.
     if not (pred.dim() == 2 or pred.dim() == 3):
         raise RuntimeError(f"Expected pred to have 2 or 3 dimensions, got {pred.shape}")
 

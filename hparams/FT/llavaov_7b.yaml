@@ -1,0 +1,37 @@
+# FT baseline for LLaVA-OneVision. Independent of ASAM / LAP / PMRL.
+
+alg_name: "FT"
+model_name: "/root/hugging_cache/llava-onevision-qwen2-7b-ov-hf"
+name: "/root/hugging_cache/llava-onevision-qwen2-7b-ov-hf"
+tokenizer_name: "/root/hugging_cache/llava-onevision-qwen2-7b-ov-hf"
+tokenizer_class: AutoProcessor
+device: 0
+dtype: torch.bfloat16
+
+layers: [27]
+num_steps: 10
+batch_size: 1
+max_length: 40
+lr: 5e-4
+weight_decay: 0
+kl_factor: 0
+norm_constraint: 1.0e-3
+objective_optimization: "target_new"
+rewrite_module_tmp: "model.language_model.layers.{}.mlp.down_proj.weight"
+layer_module_tmp: "model.language_model.layers.{}"
+mlp_module_tmp: "model.language_model.layers.{}.mlp"
+attn_module_tmp: "model.language_model.layers.{}.self_attn"
+ln_f_module: "model.language_model.norm"
+lm_head_module: "lm_head"
+model_parallel: false
+sequential_edit: false
+exact_match: false
+use_chat_template: true
+file_type: image
+
+coco_image: /root/MMEdit/images
+rephrase_image: /root/MMEdit/images
+qformer_checkpoint: .
+qformer_name_or_path: .
+state_dict_file: .
+pretrained_ckpt: .

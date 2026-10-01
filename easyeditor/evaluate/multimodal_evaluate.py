@@ -55,17 +55,22 @@ def compute_icl_multimodal_edit_quality(
     # First, unpack rewrite evaluation record.
     target = record["target"]
     prompt = record["prompt"]
-    image = record["image"] if record["image"].is_cuda else record["image"].to(hparams.device)
+    # HF multimodal records carry a PIL image; the tensor path is BLIP2/MiniGPT-4.
+    image = record["image"]
+    if torch.is_tensor(image) and not image.is_cuda:
+        image = image.to(hparams.device)
     rephrase = record["rephrase_prompt"] if 'rephrase_prompt' in record.keys() else None
     rephrase_image = record["image_rephrase"] if 'image_rephrase' in record.keys() else None
-    if rephrase_image is not None:
-        rephrase_image = rephrase_image if rephrase_image.is_cuda else rephrase_image.to(hparams.device)
+    if rephrase_image is not None and torch.is_tensor(rephrase_image) and not rephrase_image.is_cuda:
+        rephrase_image = rephrase_image.to(hparams.device)
 
     if "locality_prompt" in record.keys():
         loc_q = record["locality_prompt"]
         loc_a = record["locality_ground_truth"]
     if "multimodal_locality_image" in record.keys():
-        m_loc_image = record["multimodal_locality_image"] if record["multimodal_locality_image"].is_cuda else record["multimodal_locality_image"].to(hparams.device)
+        m_loc_image = record["multimodal_locality_image"]
+        if torch.is_tensor(m_loc_image) and not m_loc_image.is_cuda:
+            m_loc_image = m_loc_image.to(hparams.device)
         m_loc_q = record["multimodal_locality_prompt"]
         m_loc_a = record["multimodal_locality_ground_truth"]
 
@@ -122,6 +127,15 @@ def icl_multimodal_lm_eval(
         is_loc=False,
         neighborhood=False )-> typing.Dict:
     device = torch.device(f'cuda:{hparams.device}')
+
+    name = str(model_name).lower()
+    if "llava-onevision" in name or "qwen2-vl" in name:
+        context = ''.join(icl_examples)
+        prompt = f"{context}{x}" if context else x
+        file_type = "text" if image is None else "image"
+        samples = prepare_multimodal_hf_edit(hparams, tokenizer, target, [prompt], image, file_type)
+        return compute_multimodal_hf_edit_quality(model, samples, tokenizer) if not is_loc else compute_multimodal_hf_edit_quality_demo(
+            model, samples, tokenizer)
 
     samples = prepare_multimodal_edit(hparams, tokenizer, target, [''.join(icl_examples) + f'{x}'], image)
 

@@ -1,0 +1,36 @@
+alg_name: UniKE-Simplified
+name: /root/hugging_cache/llava-onevision-qwen2-7b-ov-hf
+model_name: /root/hugging_cache/llava-onevision-qwen2-7b-ov-hf
+tokenizer_class: AutoTokenizer
+tokenizer_name: /root/hugging_cache/llava-onevision-qwen2-7b-ov-hf
+device: 0
+dtype: torch.bfloat16
+inner_params: []
+l_ike_layers:
+  - language_model.layers.24.mlp
+  - language_model.layers.25.mlp
+  - language_model.layers.26.mlp
+  - language_model.layers.27.mlp
+
+edit_lr: 0.0001
+n_iter: 20
+locality_weight: 1.0
+feature_shift_scale: 0.1
+retrieval_top_k: 40
+using_asam: false
+asam_epsilon: 0.0
+asam_weight: 0.0
+qformer_checkpoint: .
+qformer_name_or_path: /root/hugging_cache/bert-base-uncased
+state_dict_file: /root/hugging_cache/eva_vit_g.pth
+pretrained_ckpt: .
+file_type: image
+coco_image: /root/MMEdit/images
+rephrase_image: /root/MMEdit/images
+exact_match: false
+sequential_edit: false
+model_parallel: false
+use_chat_template: true
+add_neuron_num: 1
+semantic_gate: true
+adam_eps: 0.0001

@@ -88,7 +88,7 @@ class WISEMultimodalHyperParams(HyperParams):
 
         with open(hparams_name_or_path, "r") as stream:
             config = yaml.safe_load(stream)
-            config = super().construct_float_from_scientific_notation(config)
+            config = super().resolve_config_paths(super().construct_float_from_scientific_notation(config))
 
         assert config['merge_freq'] % config['save_freq'] == 0, 'merge_freq need to be divisible by save_freq (like 1000 / 500)'
         assert len(config['act_margin']) == 3

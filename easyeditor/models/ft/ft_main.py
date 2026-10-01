@@ -11,6 +11,38 @@ from ...util import nethook
 from .ft_hparams import FTHyperParams
 
 
+def _is_hf_multimodal(hparams: FTHyperParams) -> bool:
+    name = str(getattr(hparams, "model_name", "")).lower()
+    return "llava-onevision" in name or "qwen2-vl" in name
+
+
+def _is_blip_family(hparams: FTHyperParams) -> bool:
+    name = str(getattr(hparams, "model_name", "")).lower()
+    return name in {"blip2", "minigpt4"}
+
+
+def _blip_supervised_batch(tok, prompt, target, image, hparams: FTHyperParams):
+    """Build the same samples dict the BLIP2 / MiniGPT4 evaluator scores."""
+    from ...evaluate.multimodal_evaluate import prepare_multimodal_edit
+
+    return prepare_multimodal_edit(hparams, tok, target, prompt, image)
+
+
+def _hf_supervised_batch(tok, prompt, target, image, hparams: FTHyperParams):
+    """Build one chat-templated teacher-forced batch for Qwen2-VL / LLaVA-OV.
+
+    The text FT path tokenises a raw string.  These two models only attend to
+    the image when the prompt goes through the processor chat template, so the
+    multimodal baseline has to build the same batch the evaluator scores.
+    """
+    from ...evaluate.multimodal_evaluate import prepare_multimodal_hf_edit
+
+    file_type = "image" if image is not None else "text"
+    return prepare_multimodal_hf_edit(
+        hparams, tok, target, prompt, image, file_type
+    )
+
+
 def apply_ft_to_model(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
@@ -82,9 +114,24 @@ def execute_ft(
     weights_copy = {k: v.detach().clone() for k, v in weights.items()}
     print(f"Weights to be updated: {list(weights.keys())}")
 
+    # BLIP2/MiniGPT4 keep the LM in fp16. A full-rank step on that dtype
+    # overflows, so the edited matrices are updated in fp32 and written back.
+    edited_fp32 = {}
+    if _is_blip_family(hparams):
+        for name, param in weights.items():
+            if param.dtype != torch.float32:
+                param_fp32 = param.detach().float().clone().requires_grad_(True)
+                edited_fp32[name] = param_fp32
+                param.requires_grad_(False)
+        if edited_fp32:
+            weights = edited_fp32
+
     # Define inputs
     texts = [r["prompt"] for r in requests]
     targets = [r["target_new"] for r in requests]
+    images = [r.get("image") for r in requests]
+    multimodal = _is_hf_multimodal(hparams)
+    blip_family = _is_blip_family(hparams)
     
     # Configure optimizer / gradients
     opt = torch.optim.Adam(
@@ -103,9 +150,101 @@ def execute_ft(
         print(20 * "=")
         loss_meter.reset()
 
-        for txt, tgt in zip(
-            chunks(texts, hparams.batch_size), chunks(targets, hparams.batch_size)
+        for txt, tgt, img in zip(
+            chunks(texts, hparams.batch_size),
+            chunks(targets, hparams.batch_size),
+            chunks(images, hparams.batch_size),
         ):
+            if multimodal:
+                assert len(txt) == 1, "HF multimodal FT edits one request at a time"
+                prepared = _hf_supervised_batch(tok, txt[0], tgt[0].lstrip(), img[0], hparams)
+                inputs_targets = prepared["multimodal_inputs"]
+                labels = prepared["labels"].to(device)
+                opt.zero_grad()
+                logits = model(**inputs_targets).logits
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss_fct = CrossEntropyLoss(reduction='none', ignore_index=-100)
+                token_loss = loss_fct(
+                    shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+                ).view(shift_labels.shape)
+                supervised = shift_labels.ne(-100)
+                denom = supervised.sum(1).clamp(min=1)
+                loss = (token_loss * supervised).sum(1) / denom
+                loss = loss.mean()
+                print(f"Batch loss {loss.item()}")
+                loss_meter.update(loss.item(), n=1)
+                if loss.item() >= 1e-2:
+                    loss.backward()
+                    opt.step()
+                if type(hparams.norm_constraint) is float:
+                    eps = hparams.norm_constraint
+                    with torch.no_grad():
+                        for k, v in weights.items():
+                            v[...] = torch.clamp(
+                                v, min=weights_copy[k] - eps, max=weights_copy[k] + eps
+                            )
+                continue
+
+            if blip_family:
+                # Same teacher-forced loss the evaluator uses: model(samples)
+                # masks the prompt via prompts_len and returns that loss.
+                # BLIP2/MiniGPT4 run the LM in fp16 autocast, and a full-rank
+                # MLP step overflows there, so the backward is done in fp32.
+                assert len(txt) == 1, "BLIP-family FT edits one request at a time"
+                image = img[0]
+                if image is not None and torch.is_tensor(image) and not image.is_cuda:
+                    image = image.to(device)
+                samples = _blip_supervised_batch(tok, txt[0], tgt[0].lstrip(), image, hparams)
+                opt.zero_grad()
+                # Forward through the fp32 copies without touching the fp16
+                # parameters: the module input is projected by the copy instead.
+                hooks = []
+                for name, param_fp32 in edited_fp32.items():
+                    # name ends in ".weight"; hook the Linear, not the parameter.
+                    module = nethook.get_module(model, name.rpartition(".")[0])
+
+                    def _swap(mod, inputs, output, fp32=param_fp32):
+                        # The BLIP-family forward wraps the LM in fp16 autocast,
+                        # which would downcast this fp32 copy again. Compute it
+                        # in fp32 explicitly. LLaMA down_proj has no bias.
+                        bias = mod.bias.float() if mod.bias is not None else None
+                        with torch.autocast("cuda", enabled=False):
+                            return torch.nn.functional.linear(
+                                inputs[0].float(), fp32, bias
+                            ).to(output.dtype)
+
+                    hooks.append(module.register_forward_hook(_swap))
+                try:
+                    outputs = model(samples)
+                finally:
+                    for hook in hooks:
+                        hook.remove()
+                logits = outputs.logits.float()
+                labels = outputs.labels
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss_fct = CrossEntropyLoss(reduction="none", ignore_index=-100)
+                token_loss = loss_fct(
+                    shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+                ).view(shift_labels.shape)
+                supervised = shift_labels.ne(-100)
+                denom = supervised.sum(1).clamp(min=1)
+                loss = ((token_loss * supervised).sum(1) / denom).mean()
+                print(f"Batch loss {loss.item()}")
+                loss_meter.update(loss.item(), n=1)
+                if loss.item() >= 1e-2:
+                    loss.backward()
+                    opt.step()
+                if type(hparams.norm_constraint) is float:
+                    eps = hparams.norm_constraint
+                    with torch.no_grad():
+                        for k, v in weights.items():
+                            v[...] = torch.clamp(
+                                v, min=weights_copy[k] - eps, max=weights_copy[k] + eps
+                            )
+                continue
+
             inputs = tok(txt, return_tensors="pt", padding=True).to(device)
             target_ids = tok(tgt, return_tensors="pt", padding=True)["input_ids"].to(
                 device

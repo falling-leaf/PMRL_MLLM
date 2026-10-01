@@ -215,13 +215,15 @@ class SeracMultimodalRewriteExecutor(SeracRewriteExecutor):
             self.tokenizer.padding_side = 'left'
         set_padding()
 
-        # Load the trained MEND model
+        # Load the trained SERAC counterfactual model.  The base VLM stays where
+        # the editor put it; only the trained classifier / replacement move.
         self.alg = SERAC_MULTI(self.model, params, lambda: deepcopy(self.model))
+        self.alg.processor = tok
         d = torch.load(params.archive, map_location='cpu')
         self.alg.load_state_dict(d["model"], False)
-        self.alg.to(torch.device(f'cuda:{params.device}'))
-        self.alg.replacement.to(torch.device(f'cuda:{params.device}'))
         self.alg.classifier.to(torch.device(f'cuda:{params.device}'))
+        if self.alg.replacement is not None:
+            self.alg.replacement.to(torch.device(f'cuda:{params.device}'))
 
         self.is_init = True
 
@@ -256,20 +258,31 @@ class SeracMultimodalRewriteExecutor(SeracRewriteExecutor):
         # Define i/o
         src = [request["prompt"]]
         trg = [(" " if request["target"][0] != " " else "") + request["target"]]
-        image = [request["image"]]
-        image = torch.stack(image, dim=0)
+        image = request.get("image")
         text_input = [s + t for s, t in zip(src, trg)]
 
         labels = trg
-        prompts_len = [len(tok.encode(s, add_special_tokens=False)) for s in src]
-
-        # Run SERAC
-        edit_inner = dict(
-            image=image,
-            text_input=text_input,
-            labels=labels,
-            prompts_len=prompts_len
-        )
+        name = str(hparams.model_name).lower()
+        if "llava-onevision" in name or "qwen2-vl" in name:
+            from ...evaluate.multimodal_evaluate import prepare_multimodal_hf_edit
+            prepared = prepare_multimodal_hf_edit(
+                hparams, tok, request["target"], request["prompt"], image, request.get("file_type", "image")
+            )
+            edit_inner = {
+                "multimodal_inputs": prepared["multimodal_inputs"],
+                "labels": prepared["labels"],
+                "image": image,
+            }
+        else:
+            if not torch.is_tensor(image):
+                image = torch.stack([image], dim=0)
+            prompts_len = [len(tok.encode(s, add_special_tokens=False)) for s in src]
+            edit_inner = dict(
+                image=image,
+                text_input=text_input,
+                labels=labels,
+                prompts_len=prompts_len
+            )
         new_model = None
 
 

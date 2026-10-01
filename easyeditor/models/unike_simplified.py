@@ -20,6 +20,7 @@ import os
 from ..util.hparams import HyperParams
 from .wise.utils import blip2_multimodal_tokenize, multimodal_tokenize
 from .wise.utils import brackets_to_periods, parent_module
+from ..util.pmrl_utils import apply_asam_deltas, asam_parameter_deltas, request_gen_views
 
 
 class ExpandedSwiGLUMLP(nn.Module):
@@ -86,11 +87,19 @@ class UniKESimplifiedHyperParams(HyperParams):
     add_neuron_num: int = 1
     semantic_gate: bool = True
     adam_eps: float = 1e-4
+    asam_scale_rho: float = 0.1
+    # Replace the clean gradient with the ASAM (perturbed) gradient.  Mixing
+    # clean+perturbed grads is equivalent to inflating the step size and was
+    # the main Acc/Gen regression on MiniGPT-4 IC.
+    asam_replace: bool = True
+    # Extra CE on the official rephrase prompt (Gen-T) and rephrase image (Gen-M).
+    gen_weight: float = 0.0
+    image_gen_weight: float = 0.0
 
     @classmethod
     def from_hparams(cls, path):
         with open(path, encoding="utf-8") as f:
-            c = HyperParams.construct_float_from_scientific_notation(yaml.safe_load(f))
+            c = HyperParams.resolve_config_paths(HyperParams.construct_float_from_scientific_notation(yaml.safe_load(f)))
         dtype = c.get("dtype")
         if isinstance(dtype, str): c["dtype"] = getattr(torch, dtype.replace("torch.", ""))
         if c.get("alg_name") != "UniKE-Simplified": raise ValueError("wrong alg_name")
@@ -98,9 +107,24 @@ class UniKESimplifiedHyperParams(HyperParams):
 
 
 def _module(model, dotted):
+    """Resolve a dotted module path, skipping a stray ``.model`` on HF LLaVA/Qwen.
+
+    Current LLaVA-OneVision wraps Qwen2 as ``language_model.layers``; older
+    configs still write ``language_model.model.layers``.
+    """
     obj = model
-    for part in brackets_to_periods(dotted).split('.'):
-        obj = getattr(obj, part)
+    parts = brackets_to_periods(dotted).split('.')
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if hasattr(obj, part):
+            obj = getattr(obj, part)
+            i += 1
+            continue
+        if part == "model" and i + 1 < len(parts) and hasattr(obj, parts[i + 1]):
+            i += 1
+            continue
+        raise AttributeError(f"{type(obj).__name__} has no attribute {part!r} while resolving {dotted}")
     return obj
 
 
@@ -217,58 +241,81 @@ class UniKESimplifiedEditor(nn.Module):
             return self.model(**dict(inputs))
         return self.model(**inputs) if isinstance(inputs, dict) else self.model(inputs)
 
-    def edit(self, edit_inputs, loc_inputs):
+    def _frozen_locality_logits(self, loc_inputs):
+        """Teacher logits from the original MLPs, without extra neurons or shift."""
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+        for parent, child, original in self.original_modules:
+            setattr(parent, child, original)
+        try:
+            with torch.no_grad():
+                return self._forward(loc_inputs).logits.detach()
+        finally:
+            for (parent, child, _original), expanded in zip(self.original_modules, self.target_modules):
+                setattr(parent, child, expanded)
+            self.handles = [module.register_forward_hook(shift) for module, shift in zip(self.target_modules, self.shifts)]
+
+    def _locality_kl(self, loc_inputs, frozen_logits):
+        post = self._forward(loc_inputs).logits
+        n = min(frozen_logits.size(1), post.size(1))
+        return F.kl_div(
+            F.log_softmax(post[:, -n:].float(), dim=-1),
+            F.softmax(frozen_logits[:, -n:].float(), dim=-1),
+            reduction="batchmean",
+        )
+
+    def _supervised_loss(self, inputs):
+        labels = None if self.hp.model_name in ("minigpt4", "blip2") else inputs["labels"]
+        return _target_loss(self._forward(inputs), labels)
+
+    def _base_loss(self, edit_inputs, loc_inputs, frozen_logits, extra_reliability=None):
+        reliability = self._supervised_loss(edit_inputs)
+        if extra_reliability:
+            for extra_inputs, weight in extra_reliability:
+                reliability = reliability + float(weight) * self._supervised_loss(extra_inputs)
+        locality = self._locality_kl(loc_inputs, frozen_logits)
+        return reliability + float(self.hp.locality_weight) * locality
+
+    def edit(self, edit_inputs, loc_inputs, extra_reliability=None):
         self._capture_memory(edit_inputs)
         # Only the intrinsic extra_* parameters are trainable (no delta in shift)
         intrinsic = [p for module in self.target_modules for name, p in module.named_parameters() if name.startswith("extra_")]
         params = intrinsic
         opt = torch.optim.Adam(params, lr=float(self.hp.edit_lr), eps=float(self.hp.adam_eps))
         diagnostics = os.environ.get("UNIKE_DIAGNOSTICS", "0") == "1"
+        frozen_logits = self._frozen_locality_logits(loc_inputs)
+        extra_reliability = extra_reliability or []
         for step in range(int(self.hp.n_iter)):
             opt.zero_grad(set_to_none=True)
-            edit_output = self._forward(edit_inputs)
-            edit_labels = None if self.hp.model_name in ("minigpt4", "blip2") else edit_inputs["labels"]
-            reliability = _target_loss(edit_output, edit_labels)
-            with torch.no_grad():
-                base = self._forward(loc_inputs).logits.detach()
-            post = self._forward(loc_inputs).logits
-            n = min(base.size(1), post.size(1))
-            locality = F.kl_div(F.log_softmax(post[:, -n:], -1), F.softmax(base[:, -n:], -1), reduction="batchmean")
-            loss = reliability + float(self.hp.locality_weight) * locality
+            loss = self._base_loss(edit_inputs, loc_inputs, frozen_logits, extra_reliability)
             if not torch.isfinite(loss):
                 raise FloatingPointError("UniKE simplified loss non-finite")
             before = [p.detach().float().clone() for p in params] if diagnostics else None
 
             if self.hp.using_asam:
-                # Accumulate base loss gradients FIRST (matching BLIP2 pattern)
-                loss.backward(retain_graph=True)
-                # Compute ASAM perturbation direction
-                grads = torch.autograd.grad(loss, params, create_graph=False, allow_unused=True)
-                scaled = [p.detach().abs() * g.float() for p, g in zip(params, grads) if g is not None]
-                norm = torch.sqrt(torch.stack([item.pow(2).sum() for item in scaled]).sum()).clamp_min(1e-12)
-                perturbations = []
-                with torch.no_grad():
-                    for p, g in zip(params, grads):
-                        if g is None:
-                            perturbations.append(None)
-                            continue
-                        scale = p.detach().abs() + 1e-2
-                        delta = float(self.hp.asam_epsilon) * scale * scale * g.float() / norm
-                        if p.dtype != delta.dtype:
-                            delta = delta.to(p.dtype)
-                        p.add_(delta)
-                        perturbations.append(delta)
+                loss.backward()
+                grads = [None if p.grad is None else p.grad.detach().clone() for p in params]
+                perturbations = asam_parameter_deltas(
+                    params,
+                    grads,
+                    float(self.hp.asam_epsilon),
+                    rho=float(getattr(self.hp, "asam_scale_rho", 0.1)),
+                )
+                replace = bool(getattr(self.hp, "asam_replace", True))
+                if replace:
+                    opt.zero_grad(set_to_none=True)
+                apply_asam_deltas(params, perturbations, sign=1.0)
                 try:
-                    asam_output = self._forward(edit_inputs)
-                    asam = _target_loss(asam_output, edit_labels)
-                    (float(self.hp.asam_weight) * asam).backward()  # ADDS to base gradients
+                    asam = self._base_loss(edit_inputs, loc_inputs, frozen_logits, extra_reliability)
+                    if not torch.isfinite(asam):
+                        raise FloatingPointError("UniKE simplified ASAM loss non-finite")
+                    scale = 1.0 if replace else float(self.hp.asam_weight)
+                    (scale * asam).backward()
+                    loss = asam.detach()
                 finally:
-                    # Always restore parameters, even if forward/backward fails
-                    with torch.no_grad():
-                        for p, d in zip(params, perturbations):
-                            if d is not None:
-                                p.sub_(d.to(p.dtype))
-                print(f"unike_asam_step={step} asam_loss={asam.detach()}")
+                    apply_asam_deltas(params, perturbations, sign=-1.0)
+                print(f"unike_asam_step={step} asam_loss={loss}")
             else:
                 loss.backward()
 
@@ -279,7 +326,7 @@ class UniKESimplifiedEditor(nn.Module):
                 grad_norms = [float(p.grad.detach().float().norm().item()) if p.grad is not None else 0.0 for p in params]
                 update_norms = [float((p.detach().float() - b).norm().item()) for p, b in zip(params, before)]
                 print(f"UNIKE_DIAGNOSTIC step={step} grad_norms={grad_norms} update_norms={update_norms}")
-            print(f"unike_step={step} total_loss={loss.detach()}")
+            print(f"unike_step={step} total_loss={loss.detach() if torch.is_tensor(loss) else loss}")
 
     def reset_layer(self):
         for h in self.handles:
@@ -290,15 +337,27 @@ class UniKESimplifiedEditor(nn.Module):
             setattr(parent, child, original)
 
 
+def _tokenize_unike_request(req, tok, device, hparams):
+    if hparams.model_name in ("minigpt4", "blip2"):
+        inputs, _, _, _, _ = blip2_multimodal_tokenize([req], tok, device, hparams=hparams)
+    else:
+        inputs, _, _, _, _ = multimodal_tokenize([req], tok, device, hparams=hparams)
+    return inputs
+
+
 def apply_unike_simplified_to_multimodal_model(model, tok, requests, hparams, copy=False, **kwargs):
     if len(requests) != 1:
         raise ValueError("simplified UniKE supports singleton edits")
     req = requests[0]
     device = f"cuda:{hparams.device}"
-    if hparams.model_name == "minigpt4":
-        inputs, _, _, _, _ = blip2_multimodal_tokenize([req], tok, device, hparams=hparams)
-    else:
-        inputs, _, _, _, _ = multimodal_tokenize([req], tok, device, hparams=hparams)
+    inputs = _tokenize_unike_request(req, tok, device, hparams)
+    extra = []
+    for view, weight in request_gen_views(
+        req,
+        getattr(hparams, "gen_weight", 0.0),
+        getattr(hparams, "image_gen_weight", 0.0),
+    ):
+        extra.append((_tokenize_unike_request(view, tok, device, hparams)[0], weight))
     editor = UniKESimplifiedEditor(model, hparams, device)
-    editor.edit(inputs[0], inputs[1])
+    editor.edit(inputs[0], inputs[1], extra_reliability=extra)
     return editor, editor.reset_layer

@@ -170,9 +170,9 @@ def get_model(config):
 
     elif "qwen2-vl" in config.model_name.lower():
         model = Qwen2VLForConditionalGeneration.from_pretrained(
-            config.name, 
+            config.name,
             torch_dtype=config.dtype,
-            # attn_implementation="flash_attention_2"
+            attn_implementation="sdpa",
         )
     else:
         ModelClass = getattr(transformers, config.model_class)

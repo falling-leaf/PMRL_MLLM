@@ -72,7 +72,7 @@ Taking the Mistral-7B-v0.1 model as an example:
 
 <div align=center>
 
-<img src="../../figs/SafeEdit_demo_gif.gif" width="70%" height="70%" />
+SafeEdit demo (animation omitted from this checkout; see the EasyEdit docs).
 
 </div>
 

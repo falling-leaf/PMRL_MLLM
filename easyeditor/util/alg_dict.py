@@ -64,6 +64,7 @@ ALG_MULTIMODAL_DICT = {
     'SERAC': SeracMultimodalRewriteExecutor().apply_to_model,
     'SERAC_MULTI': SeracMultimodalRewriteExecutor().apply_to_model,
     'IKE': apply_ike_to_multimodal_model,
+    'FT': apply_ft_to_model,
     'LoRA': apply_lora_to_multimodal_model,
     'WISE': apply_wise_to_multimodal_model,
     'Transformer-Patcher': apply_transformer_patcher_to_multimodal_model,

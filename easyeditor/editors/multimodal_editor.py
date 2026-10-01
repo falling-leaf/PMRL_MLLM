@@ -63,8 +63,9 @@ class MultimodalEditor:
         assert hparams is not None or print('Error: hparams is None.')
 
         self.model_name = hparams.model_name
-        self.apply_algo = ALG_MULTIMODAL_DICT[hparams.alg_name]
         self.alg_name = hparams.alg_name
+        # preedit scores the original model and never looks up an update rule.
+        self.apply_algo = None if self.alg_name == 'preedit' else ALG_MULTIMODAL_DICT[hparams.alg_name]
 
         make_logs()
 
@@ -546,7 +547,8 @@ class MultimodalEditor:
                     request['prompt'] = kwargs['template'].format(request['prompt'])
 
                 if self.alg_name == 'IKE':
-                    assert 'train_ds' in kwargs.keys() or print('IKE need train_ds (For getting In-Context prompt)')
+                    if int(getattr(self.hparams, 'k', 0) or 0) > 0:
+                        assert 'train_ds' in kwargs.keys() or print('IKE need train_ds (For getting In-Context prompt)')
                     edited_model, weights_copy, icl_examples = self.model, {}, self.apply_algo(
                         self.model,
                         self.tok,
@@ -555,7 +557,7 @@ class MultimodalEditor:
                         copy=False,
                         return_orig_weights=True,
                         keep_original_weight=keep_original_weight,
-                        train_ds=kwargs['train_ds']
+                        train_ds=kwargs.get('train_ds')
                     )
                 else:
                     # fixbug：COPY=False时，此处执行apply_algo前后self.model被修改，但Pre计算会引入wiseadapter的计算
@@ -569,16 +571,26 @@ class MultimodalEditor:
                     elif self.model_name in ['llava-onevision', 'qwen2-vl']:
                         pre_res = compute_multimodal_hf_edit_results(self.model, self.model_name, self.hparams, self.tok,
                                                                 request, self.hparams.device)
-                    edited_model, weights_copy = self.apply_algo(
-                        self.model,
-                        self.tok,
-                        [request],
-                        self.hparams,
-                        copy=False,
-                        return_orig_weights=True,
-                        keep_original_weight=keep_original_weight,
-                        sample_id=i if self.alg_name == 'UniKE-BLIP2' else None,
-                    )
+                    post_res = None
+                    if self.alg_name == 'preedit':
+                        # No edit is applied. Copy so the locality pop below
+                        # cannot delete the key out of pre_res as well.
+                        edited_model, weights_copy = self.model, {}
+                        post_res = copy.deepcopy(pre_res)
+                    else:
+                        if self.alg_name == 'FT':
+                            request = dict(request)
+                            request['target_new'] = request['target']
+                        edited_model, weights_copy = self.apply_algo(
+                            self.model,
+                            self.tok,
+                            [request],
+                            self.hparams,
+                            copy=False,
+                            return_orig_weights=True,
+                            keep_original_weight=keep_original_weight,
+                            sample_id=i if self.alg_name == 'UniKE-BLIP2' else None,
+                        )
                 exec_time = time() - start
                 LOG.info(f"Execution {i} editing took {exec_time}")
                 start = time()
@@ -602,12 +614,14 @@ class MultimodalEditor:
                             "pre": pre_res
                         }
                     elif self.model_name in ['llava-onevision', 'qwen2-vl']:
+                        post_res = post_res if self.alg_name == 'preedit' else compute_multimodal_hf_edit_results(
+                            edited_model, self.model_name, self.hparams, self.tok, request, self.hparams.device
+                        )
                         metrics = {
                             'case_id': i,
                             # "requested_rewrite": request,
                             "time": exec_time,
-                            "post": compute_multimodal_hf_edit_results(edited_model, self.model_name, self.hparams, self.tok,
-                                                                request, self.hparams.device),
+                            "post": post_res,
                             "pre": pre_res
                         }   
                     # metrics = {

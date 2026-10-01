@@ -1,0 +1,42 @@
+# Canonical MiniGPT-4 IC UniKE+ASAM.
+# Source: hparams/UniKE/minigpt4_ic_unike_simplified_asam.yaml
+alg_name: UniKE-Simplified
+name: /root/hugging_cache/vicuna-7b
+model_name: minigpt4
+tokenizer_class: LlamaTokenizer
+tokenizer_name: /root/hugging_cache/vicuna-7b
+device: 0
+dtype: torch.float16
+inner_params: []
+l_ike_layers:
+  - llama_model.model.layers.28.mlp
+  - llama_model.model.layers.29.mlp
+  - llama_model.model.layers.30.mlp
+  - llama_model.model.layers.31.mlp
+
+edit_lr: 0.001
+n_iter: 30
+locality_weight: 0.5
+feature_shift_scale: 0.8
+retrieval_top_k: 40
+using_asam: true
+asam_epsilon: 0.02
+asam_weight: 1.0
+asam_replace: true
+asam_scale_rho: 0.05
+gen_weight: 0.5
+image_gen_weight: 0.75
+qformer_checkpoint: /root/hugging_cache/blip2_pretrained_flant5xxl.pth
+qformer_name_or_path: /root/hugging_cache/bert-base-uncased
+state_dict_file: /root/hugging_cache/eva_vit_g.pth
+pretrained_ckpt: /root/hugging_cache/pretrained_minigpt4_7b.pth
+file_type: image
+coco_image: /root/MMEdit/images
+rephrase_image: /root/MMEdit/images
+exact_match: false
+sequential_edit: false
+model_parallel: false
+use_chat_template: true
+add_neuron_num: 10
+semantic_gate: true
+adam_eps: 0.0001

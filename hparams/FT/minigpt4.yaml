@@ -1,0 +1,40 @@
+# FT baseline for MiniGPT-4. Independent of ASAM / LAP / PMRL.
+# The loss is the model's own teacher-forced loss on prompt+target, with the
+# prompt masked the same way the multimodal evaluator masks it (FT-M).
+
+alg_name: "FT"
+model_name: minigpt4
+name: /dev/shm/vicuna
+tokenizer_class: LlamaTokenizer
+tokenizer_name: /dev/shm/vicuna
+device: 0
+dtype: torch.float32
+
+layers: [31]
+num_steps: 10
+batch_size: 1
+max_length: 40
+lr: 5e-4
+weight_decay: 0
+kl_factor: 0
+norm_constraint: 1.0e-3
+objective_optimization: "target_new"
+rewrite_module_tmp: "llama_model.model.layers.{}.mlp.down_proj.weight"
+layer_module_tmp: "llama_model.model.layers.{}"
+mlp_module_tmp: "llama_model.model.layers.{}.mlp"
+attn_module_tmp: "llama_model.model.layers.{}.self_attn"
+ln_f_module: "llama_model.model.norm"
+lm_head_module: "llama_model.lm_head"
+model_parallel: false
+sequential_edit: false
+exact_match: true
+use_chat_template: true
+file_type: image
+
+qformer_checkpoint: /root/hugging_cache/blip2_pretrained_flant5xxl.pth
+qformer_name_or_path: /root/hugging_cache/bert-base-uncased
+state_dict_file: /root/hugging_cache/eva_vit_g.pth
+pretrained_ckpt: /root/hugging_cache/pretrained_minigpt4_7b.pth
+
+coco_image: /root/MMEdit/images
+rephrase_image: /root/MMEdit/images

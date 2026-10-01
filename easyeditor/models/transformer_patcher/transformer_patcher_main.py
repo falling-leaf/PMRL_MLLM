@@ -17,6 +17,12 @@ from torch.nn import CrossEntropyLoss
 from torch.nn import functional as F
 
 from ..wise.utils import brackets_to_periods, parent_module, blip2_multimodal_tokenize, multimodal_tokenize
+from ...util.pmrl_utils import (
+    apply_asam_deltas,
+    asam_parameter_deltas,
+    request_gen_views,
+    select_pmrl_token_views,
+)
 from .layers import ExpandedLinearInput, ExpandedLinearOutput
 
 
@@ -135,23 +141,31 @@ class TransformerPatcherMultimodal(torch.nn.Module):
             return self.model(**inputs)
         return self.model(inputs)
 
-    def _base_losses(self, edit_inputs, locality_inputs):
-        outputs = self._forward_inputs(edit_inputs)
+    def _reliability(self, inputs):
+        outputs = self._forward_inputs(inputs)
         if self._is_legacy_wrapper():
-            reliability_loss = _target_loss(outputs)
-        else:
-            reliability_loss = self._hf_target_loss(outputs.logits, edit_inputs["labels"])
+            return _target_loss(outputs)
+        return self._hf_target_loss(outputs.logits, inputs["labels"])
+
+    def _base_losses(self, edit_inputs, locality_inputs, extra_reliability=None):
+        reliability_loss = self._reliability(edit_inputs)
+        if extra_reliability:
+            for extra_inputs, weight in extra_reliability:
+                reliability_loss = reliability_loss + float(weight) * self._reliability(extra_inputs)
         # Distill the untouched text-locality distribution from its frozen base
         # behavior; it is independent of the IC test answer labels.
-        with torch.no_grad():
-            self.reset_layer()
-            base_logits = self._forward_inputs(locality_inputs).logits.detach()
-            self._install_patched_layers()
+        frozen = getattr(self, "_frozen_locality_logits", None)
+        if frozen is None:
+            with torch.no_grad():
+                self.reset_layer()
+                frozen = self._forward_inputs(locality_inputs).logits.detach()
+                self._install_patched_layers()
+            self._frozen_locality_logits = frozen
         patched_logits = self._forward_inputs(locality_inputs).logits
-        length = min(base_logits.size(1), patched_logits.size(1))
+        length = min(frozen.size(1), patched_logits.size(1))
         locality_loss = F.kl_div(
-            F.log_softmax(patched_logits[:, -length:, :], dim=-1),
-            F.softmax(base_logits[:, -length:, :], dim=-1),
+            F.log_softmax(patched_logits[:, -length:, :].float(), dim=-1),
+            F.softmax(frozen[:, -length:, :].float(), dim=-1),
             reduction="batchmean",
         )
         if self.config.model_name in ("blip2", "minigpt4"):
@@ -376,7 +390,7 @@ class TransformerPatcherMultimodal(torch.nn.Module):
             handle.remove()
             if len(captured) != 1:
                 raise RuntimeError("Transformer-Patcher HF LAP capture failed")
-            views.append(captured[0].reshape(-1, captured[0].size(-1)))
+            views.append(captured[0])
             target_losses.append(self._hf_target_loss(outputs.logits, inputs["labels"]))
         base_capture = []
         handle = self.patched_fc2.register_forward_hook(lambda _m, _i, out: base_capture.append(out))
@@ -384,8 +398,14 @@ class TransformerPatcherMultimodal(torch.nn.Module):
         handle.remove()
         if len(base_capture) != 1:
             raise RuntimeError("Transformer-Patcher HF base capture failed")
+        pool_visual = bool(getattr(self.config, "pmrl_visual_pooling", False))
+        aligned = select_pmrl_token_views(
+            [base_capture[0]] + views,
+            token_mask=perturb_mask,
+            pool=pool_visual,
+        )
         pmrl = self._pmrl_loss(
-            [base_capture[0].reshape(-1, base_capture[0].size(-1))] + views,
+            aligned,
             self.config.pmrl_tau_alignment, self.config.pmrl_tau_regularization,
             self.config.pmrl_alignment_weight, self.config.pmrl_regularization_weight,
         ) * float(self.config.pmrl_scale)
@@ -396,9 +416,9 @@ class TransformerPatcherMultimodal(torch.nn.Module):
             pmrl = pmrl + target_weight * target
         return pmrl
 
-    def _loss_with_optional_pmrl(self, edit_inputs, locality_inputs):
+    def _loss_with_optional_pmrl(self, edit_inputs, locality_inputs, extra_reliability=None):
         reliability_loss, locality_loss, inputs_embeds, attention_mask, targets = self._base_losses(
-            edit_inputs, locality_inputs
+            edit_inputs, locality_inputs, extra_reliability
         )
         pmrl_loss = reliability_loss.new_zeros(())
         if self.config.using_extra and self.config.using_lap and self.config.using_pmrl:
@@ -408,8 +428,9 @@ class TransformerPatcherMultimodal(torch.nn.Module):
                 pmrl_loss = self._compute_hf_lap_pmrl_loss(edit_inputs)
         return reliability_loss + float(self.config.locality_weight) * locality_loss + pmrl_loss
 
-    def edit(self, multimodal_inputs, n_iter, edit_lr, locality_weight):
+    def edit(self, multimodal_inputs, n_iter, edit_lr, locality_weight, extra_reliability=None):
         edit_inputs, locality_inputs = multimodal_inputs
+        extra_reliability = extra_reliability or []
         parameters = list(self.patched_fc2.extra_input.parameters())
         if self._swiglu:
             parameters += list(self.patched_gate.extra_output.parameters())
@@ -423,12 +444,35 @@ class TransformerPatcherMultimodal(torch.nn.Module):
         )
         for step in range(int(n_iter)):
             optimizer.zero_grad(set_to_none=True)
-            loss = self._loss_with_optional_pmrl(edit_inputs, locality_inputs)
+            loss = self._loss_with_optional_pmrl(edit_inputs, locality_inputs, extra_reliability)
             if not torch.isfinite(loss):
                 raise FloatingPointError("Transformer-Patcher loss is non-finite")
             loss.backward()
+            if bool(getattr(self.config, "using_asam", False)):
+                grads = [None if p.grad is None else p.grad.detach().clone() for p in parameters]
+                perturbations = asam_parameter_deltas(
+                    parameters,
+                    grads,
+                    float(getattr(self.config, "asam_epsilon", 0.05)),
+                    rho=float(getattr(self.config, "asam_scale_rho", 0.1)),
+                )
+                replace = bool(getattr(self.config, "asam_replace", True))
+                if replace:
+                    optimizer.zero_grad(set_to_none=True)
+                apply_asam_deltas(parameters, perturbations, sign=1.0)
+                try:
+                    asam = self._loss_with_optional_pmrl(edit_inputs, locality_inputs, extra_reliability)
+                    if not torch.isfinite(asam):
+                        raise FloatingPointError("Transformer-Patcher ASAM loss is non-finite")
+                    scale = 1.0 if replace else float(getattr(self.config, "asam_weight", 1.0))
+                    (scale * asam).backward()
+                    loss = asam.detach()
+                    print("tpatch_asam_step={} asam_loss={}".format(step, loss))
+                finally:
+                    apply_asam_deltas(parameters, perturbations, sign=-1.0)
+            torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0)
             optimizer.step()
-            print("tpatch_step={} total_loss={}".format(step, loss.detach()))
+            print("tpatch_step={} total_loss={}".format(step, loss.detach() if torch.is_tensor(loss) else loss))
 
 
 def apply_transformer_patcher_to_multimodal_model(
@@ -441,21 +485,32 @@ def apply_transformer_patcher_to_multimodal_model(
         model = copy_module.deepcopy(model).to(device)
     editor = TransformerPatcherMultimodal(model, hparams, device)
     request = requests[0]
-    if hparams.model_name in ("blip2", "minigpt4"):
-        multimodal_inputs, _, _, _, _ = blip2_multimodal_tokenize(
-            [request], processor=tok, device=device, context_templates=None, hparams=hparams
-        )
-    elif "qwen2-vl" in hparams.model_name.lower() or "llava-onevision" in hparams.model_name.lower():
-        multimodal_inputs, _, _, _, _ = multimodal_tokenize(
-            [request], processor=tok, device=device, context_templates=None, hparams=hparams
-        )
-    else:
+
+    def _tokenize(req):
+        if hparams.model_name in ("blip2", "minigpt4"):
+            return blip2_multimodal_tokenize(
+                [req], processor=tok, device=device, context_templates=None, hparams=hparams
+            )[0]
+        if "qwen2-vl" in hparams.model_name.lower() or "llava-onevision" in hparams.model_name.lower():
+            return multimodal_tokenize(
+                [req], processor=tok, device=device, context_templates=None, hparams=hparams
+            )[0]
         raise NotImplementedError(f"Transformer-Patcher does not support model {hparams.model_name}")
+
+    multimodal_inputs = _tokenize(request)
+    extra = []
+    for view, weight in request_gen_views(
+        request,
+        getattr(hparams, "gen_weight", 0.0),
+        getattr(hparams, "image_gen_weight", 0.0),
+    ):
+        extra.append((_tokenize(view)[0], weight))
     print("Executing Transformer-Patcher: [{}] -> [{}]".format(request["prompt"], request["target"]))
     editor.edit(
         multimodal_inputs,
         n_iter=hparams.n_iter,
         edit_lr=hparams.edit_lr,
         locality_weight=hparams.locality_weight,
+        extra_reliability=extra,
     )
     return editor, editor.reset_layer

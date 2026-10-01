@@ -20,6 +20,42 @@ import torch
 import transformers
 from transformers import AutoProcessor
 
+
+def _materialise(vision_input):
+    """Decode a vision input now and detach it from its file handle.
+
+    ``LLaVAOneVisionProcessor`` / ``Qwen2VLProcessor`` return lazily-opened
+    ``PIL.Image`` objects that keep their file descriptor open.  The dataset is
+    built in the parent process and then forked by ``DataLoader``, so with
+    ``dataloader_num_workers > 0`` every worker inherits *the same open file
+    descriptions* (a shared file offset per image) but its own empty decode
+    cache.  A record handled by worker A in epoch 1 therefore loads the image
+    (offset advances to EOF, pixels cached in A's memory only); if epoch 2 hands
+    the same record to worker B, B re-reads the file from the already-advanced
+    shared offset and dies with ``OSError: image file is truncated`` - which is
+    exactly how the first 30 000-step run died at step ~1004.
+
+    Decoding in the parent and copying detaches the pixels from the file, so
+    multi-worker loading is safe by construction (and it takes the decode out of
+    the per-step collate path).  Non-image inputs are returned unchanged.
+    """
+    if isinstance(vision_input, Image.Image):
+        vision_input.load()
+        detached = vision_input.copy()
+        vision_input.close()
+        longest = max(detached.size)
+        cap = 336
+        if longest > cap:
+            scale = cap / float(longest)
+            detached = detached.resize(
+                (max(1, int(detached.size[0] * scale)), max(1, int(detached.size[1] * scale))),
+                Image.BICUBIC,
+            )
+        return detached.convert("RGB")
+    if isinstance(vision_input, (list, tuple)):
+        return [_materialise(v) for v in vision_input]
+    return vision_input
+
 class CaptionDataset(BaseDataset):
     def __init__(self, data_dir: str, size:  typing.Optional[int] = None, config=None, *args, **kwargs):
         """
@@ -46,6 +82,11 @@ class CaptionDataset(BaseDataset):
         elif "qwen2-vl" in config.model_name.lower():
             vis_processor = Qwen2VLProcessor()
             tokenizer = AutoProcessor.from_pretrained(config.name)
+            max_pixels = int(getattr(config, "qwen_max_pixels", 1280 * 28 * 28))
+            if hasattr(tokenizer, "image_processor") and tokenizer.image_processor is not None:
+                tokenizer.image_processor.max_pixels = max_pixels
+                if hasattr(tokenizer.image_processor, "size") and isinstance(tokenizer.image_processor.size, dict):
+                    tokenizer.image_processor.size["max_pixels"] = max_pixels
         elif (config is not None and hasattr(config, 'tokenizer_name')):
             tok_name = (
                 config.tokenizer_name
@@ -85,9 +126,9 @@ class CaptionDataset(BaseDataset):
             # rephrase_image = Image.open(rephrase_image_path).convert("RGB")
             # locality_image = Image.open(locality_image_path).convert("RGB")
 
-            image = self.vis_processor(image_path, file_type="image")
-            rephrase_image = self.vis_processor(rephrase_image_path, file_type="image")  
-            locality_image = self.vis_processor(locality_image_path, file_type="image") 
+            image = _materialise(self.vis_processor(image_path, file_type="image"))
+            rephrase_image = _materialise(self.vis_processor(rephrase_image_path, file_type="image"))
+            locality_image = _materialise(self.vis_processor(locality_image_path, file_type="image"))
                       
             item = {
                 'prompt': record['src'],
@@ -123,6 +164,19 @@ class CaptionDataset(BaseDataset):
     
     def __len__(self):
         return len(self._data)
+
+    def _collate_device(self):
+        """Device to place collated tensors on, or ``None`` inside a worker.
+
+        ``DataLoader`` workers are forked after the parent process initialised
+        CUDA, so a forked worker must never touch a CUDA device.  When
+        ``dataloader_num_workers > 0`` the collate therefore returns CPU
+        tensors and ``MultimodalTrainer._batch_to_device`` moves the finished
+        batch in the training process.
+        """
+        if torch.utils.data.get_worker_info() is not None:
+            return None
+        return getattr(self.config, "device", None)
 
     def collate_fn(self, batch):
         src = [b['prompt'] for b in batch]
@@ -172,21 +226,47 @@ class CaptionDataset(BaseDataset):
 
             processor_kwargs = {"text": text_inputs, "return_tensors": "pt", "padding": True}
             if file_type in ["image", "single-image", "multi-image"]:
+                def _resize_for_qwen(im):
+                    if "qwen2-vl" not in model_name or im is None:
+                        return im
+                    if isinstance(im, list):
+                        return [_resize_for_qwen(x) for x in im]
+                    if not isinstance(im, Image.Image):
+                        return im
+                    longest = max(im.size)
+                    cap = 448
+                    if longest > cap:
+                        scale = cap / float(longest)
+                        im = im.resize((max(1, int(im.size[0] * scale)), max(1, int(im.size[1] * scale))), Image.BICUBIC)
+                    return im.convert("RGB")
+                images_list = [_resize_for_qwen(im) for im in images_list]
                 processor_kwargs["images"] = images_list
             multimodal_inputs = self.tok(**processor_kwargs)
 
-            target_tokens = self.tok.tokenizer(
+            target_batch = self.tok.tokenizer(
                 targets,
                 add_special_tokens=False,
                 return_tensors="pt",
                 padding=True,
-                # max_length=multimodal_inputs["input_ids"].size(1),
-            )["input_ids"]
+            )
+            target_tokens = target_batch["input_ids"]
+            target_attention = target_batch.get("attention_mask", target_tokens.ne(0))
 
             labels = torch.full_like(multimodal_inputs["input_ids"], -100)
-            labels[:, -target_tokens.size(1) :] = target_tokens
+            if target_tokens.shape[1] > labels.shape[1]:
+                raise ValueError("Target tokens are longer than the multimodal input")
+            target_width = target_tokens.shape[1]
+            for row in range(target_tokens.shape[0]):
+                valid_target = target_attention[row].bool()
+                n_target = int(valid_target.sum().item())
+                if n_target == 0:
+                    raise ValueError("HF multimodal batch contains an empty target")
+                labels[row, -n_target:] = target_tokens[row, valid_target]
+            supervised = labels.ne(-100)
+            if not supervised.any():
+                raise ValueError("HF multimodal batch contains no supervised target tokens")
 
-            device = getattr(self.config, "device", None)
+            device = self._collate_device()
             target_dtype = getattr(self.config, "dtype", None)
             for k, v in multimodal_inputs.items():
                 if isinstance(v, torch.Tensor):
@@ -278,7 +358,7 @@ class CaptionDataset(BaseDataset):
                 # max_length=self.max_length,
                 truncation=True,
             )
-            device = getattr(self.config, "device", None)
+            device = self._collate_device()
             if device is not None:
                 for k, v in cond.items():
                     if isinstance(v, torch.Tensor):
@@ -300,4 +380,7 @@ class CaptionDataset(BaseDataset):
             "loc_image": loc_image,
             "cond": cond
         }
-        return dict_to(batch, self.config.device)
+        device = self._collate_device()
+        if device is None:
+            return batch
+        return dict_to(batch, device)

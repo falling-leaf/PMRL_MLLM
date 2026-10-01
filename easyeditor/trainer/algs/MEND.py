@@ -1,5 +1,6 @@
 import copy
 import logging
+import os
 from collections import defaultdict
 
 import higher
@@ -19,11 +20,24 @@ from higher.patch import (
 from .patch import monkeypatch as _make_functional
 
 from . import local_nn
+from . import profiling
 from .editable_model import EditableModel
-from .hooks import hook_model
-from ..utils import _inner_params, _logits
+from .hooks import hook_model, clear_mend_state, assert_mend_state_consumed
+from ..utils import _inner_params, _logits, parent_module
+from ..losses import hf_target_loss
+from ...util.pmrl_utils import select_pmrl_token_views
 
 LOG = logging.getLogger(__name__)
+
+# ``MEND_NORM_SEQUENTIAL=1`` restores the original per-row Python Welford loop
+# used before the block-wise update.  It exists purely to reproduce old runs
+# bit for bit; the two implementations compute the same statistics.
+_LEGACY_NORM_LOOP = os.environ.get("MEND_NORM_SEQUENTIAL", "0").lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+)
 
 
 class _FunctionalModel(nn.Module):
@@ -42,6 +56,13 @@ class _FunctionalModel(nn.Module):
         # temporary wrapper's parameters.
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_fast_params", dict(fast_params))
+        known = {name for name, _ in model.named_parameters()}
+        missing = [key for key in self._fast_params if key not in known]
+        if missing:
+            raise KeyError(
+                "fast_params keys are not in the wrapped model; "
+                f"functional_call(strict=False) would silently skip the edit: {missing}"
+            )
 
     def forward(self, *args, **kwargs):
         return torch.func.functional_call(
@@ -53,6 +74,34 @@ def update_counter(x, m, s, k):
     new_m = m + (x - m) / k
     new_s = s + (x - m) * (x - new_m)
 
+    return new_m, new_s
+
+
+def batch_update_counter(x, m, s, k0):
+    """Block form of :func:`update_counter` for a stack of rows.
+
+    ``x`` is ``[n, dim]``, ``m``/``s`` are the running mean / sum of squared
+    deviations of the ``k0`` samples seen so far.  Uses the standard parallel
+    combination identity of Welford's recursion::
+
+        k1 = k0 + n
+        m1 = m0 + (mean(x) - m0) * n / k1
+        s1 = s0 + sum((x - mean(x))**2) + (mean(x) - m0)**2 * k0 * n / k1
+
+    which yields exactly the same statistics and the same ``k`` as applying
+    :func:`update_counter` row by row (only the floating point reduction order
+    differs).  It replaces ~13 tensor ops *per row* with a handful of ops for
+    the whole block, which is what makes meta-training steps fast: the row loop
+    issued ~1e5 micro-kernels per transform on a ~9k-row activation.
+    """
+    n = x.shape[0]
+    batch_mean = x.mean(dim=0)
+    centered = x - batch_mean
+    batch_s = (centered * centered).sum(dim=0)
+    k1 = k0 + n
+    delta = batch_mean - m
+    new_m = m + delta * (n / k1)
+    new_s = s + batch_s + delta * delta * ((k0 * n) / k1)
     return new_m, new_s
 
 
@@ -131,19 +180,15 @@ class GradientTransform(nn.Module):
         else:
             self.mlp1, self.mlp2 = x_net(), delta_net()
 
-    def forward(self, u, v, param_idx=None):
-        u, v = u.to(torch.float32), v.to(torch.float32)
+    def _update_running_stats(self, u_, v_):
+        """Fold the captured rows into the running normalisation statistics.
 
-        u_ = u.view(-1, u.shape[-1])
-        v_ = v.view(-1, v.shape[-1])
-
-        nz_mask = (u_ != 0).any(-1) * (v_ != 0).any(
-            -1
-        )  # Skip batch elements with zero grad
-        u_ = u_[nz_mask]
-        v_ = v_[nz_mask]
-
-        if self.training:
+        Both branches below implement the same Welford recursion; the default
+        branch evaluates it block-wise (see :func:`batch_update_counter`) while
+        ``MEND_NORM_SEQUENTIAL=1`` keeps the original per-row Python loop for
+        bit-for-bit reproduction of runs made before this optimisation.
+        """
+        if _LEGACY_NORM_LOOP:
             for idx in range(u_.shape[0]):
                 if not self.norm_init:
                     self.u_mean = u_[idx].clone().detach()
@@ -160,6 +205,50 @@ class GradientTransform(nn.Module):
                     self.v_mean, self.v_s = update_counter(
                         v_[idx], self.v_mean, self.v_s, self.k
                     )
+            return
+
+        if u_.shape[0] == 0:
+            return
+
+        if not self.norm_init:
+            # First-ever pair initialises the statistics exactly as the
+            # sequential loop did: mean = x[0], s = 0, k = 1.
+            self.u_mean = u_[0].clone().detach()
+            self.v_mean = v_[0].clone().detach()
+            self.u_s = torch.zeros_like(self.u_mean)
+            self.v_s = torch.zeros_like(self.v_mean)
+            self.k[:] = 1
+            self.norm_init = True
+            u_, v_ = u_[1:], v_[1:]
+
+        n_new = u_.shape[0]
+        if n_new == 0:
+            return
+
+        k_prev = self.k
+        self.u_mean, self.u_s = batch_update_counter(
+            u_, self.u_mean, self.u_s, k_prev
+        )
+        self.v_mean, self.v_s = batch_update_counter(
+            v_, self.v_mean, self.v_s, k_prev
+        )
+        self.k[:] = k_prev + n_new
+
+    def forward(self, u, v, param_idx=None):
+        u, v = u.to(torch.float32), v.to(torch.float32)
+
+        u_ = u.view(-1, u.shape[-1])
+        v_ = v.view(-1, v.shape[-1])
+
+        nz_mask = (u_ != 0).any(-1) * (v_ != 0).any(
+            -1
+        )  # Skip batch elements with zero grad
+        u_ = u_[nz_mask]
+        v_ = v_[nz_mask]
+
+        if self.training:
+            with profiling.section("mend.norm_stats"):
+                self._update_running_stats(u_, v_)
 
             if self.cfg.norm and self.k >= 2:
                 self.u_std = (self.u_s / (self.k - 1)) ** 0.5
@@ -198,18 +287,26 @@ class MEND(EditableModel):
     def __init__(self, model, config, model_constructor, mend=None, edit_lrs=None):
         super().__init__(model, config, model_constructor)
 
-        if not str(self.config.device).startswith('cuda'):
-            self.config.device = f'cuda:{self.config.device}'
+        configured_device = self.config.device
+        if isinstance(configured_device, int) or str(configured_device).isdigit():
+            index = int(configured_device)
+            self.config.device = torch.device(
+                f"cuda:{index}" if torch.cuda.is_available() else "cpu"
+            )
+        else:
+            self.config.device = torch.device(str(configured_device))
+        # BaseTrainer resolves the public config too; keep this wrapper's copy
+        # in sync because EditableModel deep-copies the config above.
+        config.device = self.config.device
 
+        inner_names = set(self.config.inner_params)
         for n, p in model.named_parameters():
-            if n not in self.config.inner_params:
-                # Fast weights produced by MEND are non-leaf tensors. Their
-                # requires_grad flag cannot be mutated; they already inherit
-                # the correct graph from the functionalized model.
-                if p.is_leaf:
-                    p.requires_grad = False
-            else:
-                break # 因为其到末尾的计算图是需要保存的，这里由于编辑的都是最后几层，因此并不影响
+            # Do not rely on parameter ordering: HF multimodal target names can
+            # be interleaved with frozen vision/language parameters.  Enabling
+            # gradients only for the explicit MEND targets reduces backward
+            # memory and prevents unrelated parameters from accumulating state.
+            if n not in inner_names and p.is_leaf:
+                p.requires_grad = False
 
         if edit_lrs is None:
             edit_lrs = nn.Parameter(
@@ -322,27 +419,22 @@ class MEND(EditableModel):
     def outer_parameters(self):
         return list(self.mend.parameters()) + [self.edit_lrs]
 
+    def _hf_last_decoder_layer(self):
+        core = self.model.model
+        if hasattr(core, "language_model") and hasattr(core.language_model, "layers"):
+            return core.language_model.layers[-1]
+        if hasattr(core, "layers"):
+            return core.layers[-1]
+        raise AttributeError("Could not locate the last language-model decoder layer")
+
     @staticmethod
-    def _hf_target_loss(logits, labels, reduction="mean"):
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        selected = shift_labels.ne(-100)
-        if not selected.any():
-            raise RuntimeError("MEND LAP batch has no supervised target tokens")
-        return F.cross_entropy(
-            shift_logits[selected], shift_labels[selected], reduction=reduction
+    def _hf_target_loss(logits, labels, reduction="mean", attention_mask=None):
+        """Compatibility wrapper around the shared masked HF causal loss."""
+        return hf_target_loss(
+            logits, labels, attention_mask=attention_mask, reduction=reduction
         )
 
-    def _compute_hf_lap_pmrl_loss(self, batch, base_hidden):
-        """LAP+PMRL inner-loss augmentation for HF multimodal MEND.
-
-        This intentionally augments the *inner* loss before MEND reads hook
-        deltas, so the learned gradient transform is trained and applied from
-        the same enhanced edit gradient.  It has no filesystem side effects.
-        """
-        # Both supported HF multimodal families expose their fusion helpers on
-        # the inner model, but Qwen2-VL and LLaVA-OneVision use different image
-        # metadata and positional-encoding APIs.
+    def _prepare_hf_visual_mask(self, batch):
         core = self.model.model
         input_ids, labels = batch["input_ids"], batch["labels"]
         text_embeds = core.get_input_embeddings()(input_ids)
@@ -353,87 +445,68 @@ class MEND(EditableModel):
             )
             if isinstance(image_features, (tuple, list)):
                 image_features = torch.cat(image_features, dim=0)
-            image_mask, _ = core.get_placeholder_mask(
-                input_ids, inputs_embeds=text_embeds, image_features=image_features
-            )
-            fused = text_embeds.masked_scatter(image_mask, image_features)
-            # LLaVA-OneVision uses ordinary Qwen2 positions; the wrapper can
-            # derive them from attention_mask when input_ids is omitted.
-            forward_kwargs = dict(
-                attention_mask=batch["attention_mask"],
-                use_cache=False, return_dict=True, output_hidden_states=True,
-            )
         else:
             image_features = torch.cat(core.get_image_features(
                 batch["pixel_values"], batch.get("image_grid_thw")
             ), dim=0).to(text_embeds.device, text_embeds.dtype)
-            image_mask, _ = core.get_placeholder_mask(
-                input_ids, inputs_embeds=text_embeds, image_features=image_features
-            )
-            fused = text_embeds.masked_scatter(image_mask, image_features)
-            position_ids, _ = core.get_rope_index(
-                input_ids, batch.get("image_grid_thw"), batch.get("video_grid_thw"),
-                batch["attention_mask"],
-            )
-            forward_kwargs = dict(
-                attention_mask=batch["attention_mask"], position_ids=position_ids,
-                use_cache=False, return_dict=True, output_hidden_states=True,
-            )
-        fused = fused.to(text_embeds.device, text_embeds.dtype)
-        # Do not let the probe's autograd pass populate MEND hook factors.
-        for module in self.model.modules():
-            module._mend_capture = False
-        probe = fused.detach().clone().requires_grad_(True)
-        probe_outputs = self.model(inputs_embeds=probe, **forward_kwargs)
-        probe_loss = self._hf_target_loss(probe_outputs.logits, labels, "sum")
-        grad = torch.autograd.grad(probe_loss, probe, retain_graph=False)[0]
-        for module in self.model.modules():
-            module._mend_capture = True
-        answer_mask = labels.ne(-100)
-        if getattr(self.config, "using_image_embedding", True):
-            perturb_mask = image_mask.any(dim=-1)
-        else:
-            perturb_mask = (~answer_mask) & batch["attention_mask"].bool()
+        image_mask, _ = core.get_placeholder_mask(
+            input_ids, inputs_embeds=text_embeds, image_features=image_features
+        )
+        perturb_mask = image_mask.any(dim=-1)
+        if not getattr(self.config, "using_image_embedding", True):
+            perturb_mask = (~labels.ne(-100)) & batch["attention_mask"].bool()
         if not perturb_mask.any():
             raise RuntimeError("MEND LAP perturbation region is empty")
-        masked_grad = grad * perturb_mask.unsqueeze(-1).to(grad.dtype)
-        norm = masked_grad.float().flatten(1).norm(dim=1).clamp_min(1e-8)
-        direction = masked_grad / norm.to(grad.dtype).view(-1, 1, 1)
-        views = [base_hidden]
-        variant_losses = []
-        n_views = int(self.config.num_rephrase)
-        epsilon = float(self.config.lap_epsilon)
-        for idx in range(n_views):
-            delta = direction.detach() * (epsilon * float(idx + 1) / n_views)
-            out = self.model(inputs_embeds=fused.detach() + delta, **forward_kwargs)
-            views.append(out.hidden_states[-1])
-            variant_losses.append(self._hf_target_loss(out.logits, labels))
-        flattened = [F.normalize(v.reshape(-1, v.size(-1)).float(), dim=-1) for v in views]
-        if len({tuple(v.shape) for v in flattened}) != 1:
-            raise RuntimeError("MEND LAP hidden-state view shapes differ")
-        anchor = flattened[0].detach()
-        alignment = torch.stack([1 - (anchor * v).sum(-1).mean() for v in flattened[1:]]).mean()
+        return perturb_mask
+
+    def _visual_pmrl_from_views(self, live_hidden, views):
+        selected = select_pmrl_token_views([live_hidden] + views, token_mask=None, pool=False)
+        if len(selected) < 2:
+            raise RuntimeError("MEND PMRL needs the original view plus at least one LAP view")
+        flattened = [F.normalize(v.float(), dim=-1) for v in selected]
+        live = flattened[0]
+        alignment = torch.stack([1 - (live * v.detach()).sum(-1).mean() for v in flattened[1:]]).mean()
+        alignment_loss = alignment / float(self.config.pmrl_tau_alignment)
         consensus = F.normalize(torch.stack(flattened, dim=1).mean(dim=1), dim=-1)
         logits = consensus @ consensus.T / float(self.config.pmrl_tau_regularization)
         target = torch.arange(logits.size(0), device=logits.device)
         regularization = F.cross_entropy(logits, target)
+        balanced_regularization = (
+            regularization
+            / regularization.detach().clamp_min(1e-8)
+            * alignment_loss.detach().clamp_min(1e-8)
+        )
         pmrl = (
-            float(self.config.pmrl_alignment_weight) * alignment / float(self.config.pmrl_tau_alignment)
-            + float(self.config.pmrl_regularization_weight) * regularization
+            float(self.config.pmrl_alignment_weight) * alignment_loss
+            + float(self.config.pmrl_regularization_weight) * balanced_regularization
         ) * float(self.config.pmrl_scale)
         if not torch.isfinite(pmrl):
             raise FloatingPointError("MEND PMRL loss is non-finite")
-        return pmrl + torch.stack(variant_losses).mean() * float(
-            getattr(self.config, "lar_target_loss_weight", 0.0)
-        )
+        return pmrl
 
-    def _maybe_mend_extra_loss(self, batch, base_hidden):
+    def _hidden_space_visual_pmrl(self, live_visual):
+        """UniKE-style neighborhood: perturb visual tokens in hidden space.
+
+        Extra 7B LAP forwards OOM even at 83–95GB because they overlap the
+        main MEND edit graph.  A detached hidden-space view keeps visual
+        alignment in the inner loss without a second model pass.
+        """
+        epsilon = float(self.config.lap_epsilon)
+        noise = torch.randn_like(live_visual)
+        noise = noise / noise.float().norm(dim=-1, keepdim=True).clamp_min(1e-8).to(noise.dtype)
+        view = (live_visual.detach() + epsilon * noise).detach()
+        return self._visual_pmrl_from_views(live_visual, [view])
+
+    def _maybe_mend_extra_loss(self, batch, base_hidden=None, training=True):
         if not (
             getattr(self.config, "using_extra", False)
             and getattr(self.config, "using_lap", False)
             and getattr(self.config, "using_pmrl", False)
         ):
-            return base_hidden.new_zeros(())
+            if base_hidden is not None:
+                return base_hidden.new_zeros(())
+            device = next(self.model.parameters()).device
+            return torch.zeros((), device=device)
         if (
             "qwen2-vl" not in self.config.model_name.lower()
             and "llava-onevision" not in self.config.model_name.lower()
@@ -441,13 +514,25 @@ class MEND(EditableModel):
             raise NotImplementedError(
                 "MEND LAP+PMRL currently supports Qwen2-VL and LLaVA-OneVision"
             )
-        return self._compute_hf_lap_pmrl_loss(batch, base_hidden)
+        views = None
+        live = base_hidden
+        if live is None:
+            raise RuntimeError("MEND PMRL needs the main-edit last-layer hidden state")
+        if live.ndim == 3:
+            mask = self._prepare_hf_visual_mask(batch)
+            live = live[mask]
+        return self._hidden_space_visual_pmrl(live)
 
-    def edit(self, batch, condition=None, detach_history=False, return_factors=False, **kwargs):
+    def edit(self, batch, condition=None, detach_history=False, return_factors=False,
+             training=True, **kwargs):
+        # Re-enable factor capture for the inner edit forward.  The trainer
+        # disables it around checkpointed post-edit forwards so recomputation
+        # cannot leave stale activation stacks behind.
+        for module in self.model.modules():
+            if hasattr(module, "_mend_capture"):
+                module._mend_capture = True
         # Remove stale hook state from trainer pre-edit locality forwards.
-        for _, p in _inner_params(self.model.named_parameters(), self.config.inner_params):
-            p.__mend_x_stack__ = []
-            p.__mend_pairs__ = []
+        clear_mend_state(self.model, self.config.inner_params)
         if 'minigpt4' in self.config.model_name.lower() or 'blip' in self.config.model_name.lower():
             outputs = self.model(batch)        
             if not isinstance(outputs, torch.Tensor):
@@ -462,12 +547,39 @@ class MEND(EditableModel):
                 and getattr(self.config, "using_lap", False)
                 and getattr(self.config, "using_pmrl", False)
             )
+            apply_extra = extra_enabled and (
+                training or getattr(self.config, "mend_extra_at_eval", False)
+            )
             model_inputs = dict(batch)
             model_inputs.pop("labels", None)
-            outputs = self.model(**model_inputs, output_hidden_states=extra_enabled)
-            loss = self._hf_target_loss(outputs.logits, batch["labels"])
-            if extra_enabled:
-                loss = loss + self._maybe_mend_extra_loss(batch, outputs.hidden_states[-1])
+            captured_hidden = []
+            capture_handle = None
+            perturb_mask = None
+            if apply_extra:
+                perturb_mask = self._prepare_hf_visual_mask(batch)
+                last_layer = self._hf_last_decoder_layer()
+                capture_handle = last_layer.register_forward_hook(
+                    lambda _m, _i, out, bucket=captured_hidden, mask=perturb_mask: bucket.append(
+                        (out[0] if isinstance(out, tuple) else out)[mask].clone()
+                    )
+                )
+            try:
+                with profiling.section("edit.fwd_edit"):
+                    outputs = self.model(**model_inputs)
+            finally:
+                if capture_handle is not None:
+                    capture_handle.remove()
+            with profiling.section("edit.loss"):
+                loss = self._hf_target_loss(
+                    outputs.logits, batch["labels"],
+                    attention_mask=batch.get("attention_mask"),
+                )
+                if apply_extra:
+                    if not captured_hidden:
+                        raise RuntimeError("MEND extra hidden capture failed")
+                    extra = self._hidden_space_visual_pmrl(captured_hidden.pop())
+                    loss = loss + extra
+                    del extra, captured_hidden, perturb_mask
             outputs = outputs.logits
         elif 'gpt' in self.config.model_name.lower():
             outputs = _logits(self.model(input_ids=batch['input_ids'], attention_mask=batch['attention_mask']))
@@ -512,7 +624,16 @@ class MEND(EditableModel):
         for p in pset:
             assert p in names, f"inner param {p} not in model"
 
-        loss.backward()
+        try:
+            with profiling.section("edit.backward"):
+                loss.backward()
+            del loss, outputs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            assert_mend_state_consumed(self.model, self.config.inner_params)
+        except Exception:
+            clear_mend_state(self.model, self.config.inner_params)
+            raise
 
         def captured_factors(p):
             pairs = getattr(p, "__mend_pairs__", [])
@@ -552,10 +673,13 @@ class MEND(EditableModel):
             targ = "ij"
         else:
             targ = "ji"
-        mean_grads = {
-            n: torch.einsum(f"bi,bj->{targ}", x, delta)
-            for n, (x, delta) in transformed_factors.items()
-        }
+        with profiling.section("edit.einsum"):
+            mean_grads = {
+                n: torch.einsum(f"bi,bj->{targ}", x, delta)
+                for n, (x, delta) in transformed_factors.items()
+            }
+        del transformed_factors
+        clear_mend_state(self.model, self.config.inner_params)
 
         info_dict = {}
         if getattr(self.config, "mend_log_grad_diagnostics", False):
@@ -570,11 +694,14 @@ class MEND(EditableModel):
                 sum(g.float().norm().item() for g in mean_grads.values())
             )
         if return_factors:
-            info_dict["factors"] = transformed_factors
-        # Full 3.5B-parameter cosine/difference diagnostics allocate another
-        # weight-sized temporary tensor. They are not part of optimization and
-        # caused final validation OOM on a 48GB Qwen2-VL run.
-        if getattr(self.config, "mend_log_grad_diagnostics", False):
+            info_dict["factors"] = locals().get("transformed_factors")
+        # Full weight-sized (2x68M) magnitude/std/cosine diagnostics. They are
+        # not part of the optimisation, allocate several weight-sized temporaries
+        # and 12 blocking .item() syncs per step, and the trainer's averager
+        # drops every "grad/" key (see RunningStatAverager exclude list) so the
+        # values were never logged.  Keep them available behind their own flag
+        # for one-off debugging, off by default so the step stays cheap.
+        if getattr(self.config, "mend_log_weight_diagnostics", False):
             idx = 0
             for n, p in _inner_params(
                 self.model.named_parameters(), self.config.inner_params
@@ -599,11 +726,16 @@ class MEND(EditableModel):
         # the non-leaf tensors into detached Parameters and silently yields no
         # MEND outer gradients.
         if "llava-onevision" in self.config.model_name.lower() or "qwen2-vl" in self.config.model_name.lower():
-            fast_params = {}
-            for n, p in self.model.named_parameters():
-                fast_params[n] = p + updates[n].to(p.dtype) if n in pset else p
+            fast_params = {
+                n: p + updates[n].to(p.dtype)
+                for n, p in _inner_params(
+                    self.model.named_parameters(), self.config.inner_params
+                )
+            }
             base_model = _FunctionalModel(self.model, fast_params)
-            diagnostic_params = fast_params.values()
+            diagnostic_params = list(fast_params.values())
+            if getattr(self.config, "mend_log_grad_diagnostics", False):
+                info_dict["diag/fast_keys_applied"] = float(len(fast_params))
         else:
             base_model = self.model
             if 'minigpt4' in self.config.model_name.lower() or 'blip' in self.config.model_name.lower():

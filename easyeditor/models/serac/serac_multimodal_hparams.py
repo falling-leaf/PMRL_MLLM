@@ -3,6 +3,8 @@ from ...util.hparams import HyperParams
 from typing import Optional, Any, List
 import yaml
 
+import torch
+
 
 @dataclass
 class SERACMultimodalHparams(HyperParams):
@@ -89,7 +91,12 @@ class SERACMultimodalHparams(HyperParams):
     model_parallel: bool = False
     qformer_checkpoint: Optional[str] = None
     freeze_qformer: bool = True
-    pretrained_ckpt: Optional[str] = None  
+    pretrained_ckpt: Optional[str] = None
+    dtype: torch.dtype = torch.float32
+    sequential_edit: bool = False
+    use_chat_template: bool = True
+    file_type: str = "image"
+    qwen_max_pixels: int = 1280 * 28 * 28
 
 
     @classmethod
@@ -100,7 +107,9 @@ class SERACMultimodalHparams(HyperParams):
 
         with open(hparams_name_or_path, "r") as stream:
             config = yaml.safe_load(stream)
-            config = super().construct_float_from_scientific_notation(config)
+            config = super().resolve_config_paths(super().construct_float_from_scientific_notation(config))
+        if isinstance(config.get("dtype"), str):
+            config["dtype"] = getattr(torch, config["dtype"].replace("torch.", ""))
 
 
         assert (config and config['alg'] == 'SERAC_MULTI') or print(f'SERACMultimodalHparams can not load from {hparams_name_or_path}, '

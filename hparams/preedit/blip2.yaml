@@ -1,0 +1,22 @@
+# preedit: score the original BLIP2 model, apply no edit. Not an ASAM run.
+
+alg_name: "preedit"
+model_name: blip2
+name: /root/hugging_cache/opt-2.7b
+tokenizer_class: GPT2Tokenizer
+tokenizer_name: /root/hugging_cache/opt-2.7b
+device: 0
+dtype: torch.float32
+
+sequential_edit: false
+exact_match: true
+use_chat_template: false
+file_type: image
+
+qformer_checkpoint: /root/hugging_cache/blip2_pretrained_opt2.7b.pth
+qformer_name_or_path: /root/hugging_cache/bert-base-uncased
+state_dict_file: /root/hugging_cache/eva_vit_g.pth
+pretrained_ckpt: null
+
+coco_image: /root/MMEdit/images
+rephrase_image: /root/MMEdit/images

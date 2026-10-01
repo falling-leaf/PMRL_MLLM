@@ -1,0 +1,22 @@
+# preedit: score the original MiniGPT-4 model, apply no edit. Not an ASAM run.
+
+alg_name: "preedit"
+model_name: minigpt4
+name: /dev/shm/vicuna
+tokenizer_class: LlamaTokenizer
+tokenizer_name: /dev/shm/vicuna
+device: 0
+dtype: torch.float32
+
+sequential_edit: false
+exact_match: true
+use_chat_template: true
+file_type: image
+
+qformer_checkpoint: /root/hugging_cache/blip2_pretrained_flant5xxl.pth
+qformer_name_or_path: /root/hugging_cache/bert-base-uncased
+state_dict_file: /root/hugging_cache/eva_vit_g.pth
+pretrained_ckpt: /root/hugging_cache/pretrained_minigpt4_7b.pth
+
+coco_image: /root/MMEdit/images
+rephrase_image: /root/MMEdit/images

@@ -1,0 +1,64 @@
+\begin{table}[t]
+\centering
+\caption{\textbf{Performance comparison on the MMEdit benchmark.} We report Reliability (Rel.), Generality (Gen.), and textual and multimodal Locality (T-Loc. and M-Loc.) on Editing VQA (E-VQA) and Editing Image Caption (E-IC).}
+\label{tab:pmrl_master}
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{ll|cccc|cccc}
+\toprule
+& & \multicolumn{4}{c|}{\textbf{E-VQA}} & \multicolumn{4}{c}{\textbf{E-IC}} \\
+\cmidrule(lr){3-6} \cmidrule(lr){7-10}
+\textbf{MLLM} & \textbf{Method}
+& \textbf{Rel.}$\uparrow$ & \textbf{Gen.}$\uparrow$ & \textbf{T-Loc.}$\uparrow$ & \textbf{M-Loc.}$\uparrow$
+& \textbf{Rel.}$\uparrow$ & \textbf{Gen.}$\uparrow$ & \textbf{T-Loc.}$\uparrow$ & \textbf{M-Loc.}$\uparrow$ \\
+\midrule
+\multirow{8}{1.7cm}{\centering\textbf{BLIP2-OPT}} & WISE & 99.00 & 84.80 & 100.00 & 8.99 & 100.00 & 82.54 & 99.84 & 10.28 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{WISE} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{99.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{93.97} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{9.73} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{86.22} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{10.74} \\
+\cmidrule{2-10}
+& MEND & 95.22 & 94.17 & 99.53 & 92.35 & 76.10 & 60.30 & 98.18 & 79.16 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{MEND} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{95.99} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{94.65} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{99.66} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{93.80} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{77.40} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{62.60} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{98.29} &\cellcolor[rgb]{0.949,0.949,0.949} 79.07 \\
+\cmidrule{2-10}
+& T-Patcher & 96.43 & 87.43 & 99.93 & 22.61 & 94.74 & 70.07 & 99.93 & 37.61 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{T-Patcher} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{97.38} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{90.42} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{99.93} &\cellcolor[rgb]{0.949,0.949,0.949} 20.41 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{95.05} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{71.43} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{99.93} &\cellcolor[rgb]{0.949,0.949,0.949} 34.83 \\
+\cmidrule{2-10}
+& UniKE & \textbf{100.00} & \textbf{100.00} & 74.39 & 7.04 & \textbf{100.00} & 86.51 & \textbf{100.00} & 10.23 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{UniKE} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{81.77} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{12.42} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{94.97} &\cellcolor[rgb]{0.949,0.949,0.949} 99.57 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{10.77} \\
+\midrule
+\multirow{8}{1.7cm}{\centering\textbf{MiniGPT-4}} & WISE & 100.00 & 98.86 & 100.00 & 56.48 & 95.68 & 83.01 & 100.00 & 89.80 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{WISE} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{99.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{56.75} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{95.84} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{83.36} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} 88.49 \\
+\cmidrule{2-10}
+& MEND & 96.13 & 95.41 & 99.61 & 93.92 & 82.00 & 59.60 & 99.17 & 87.17 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{MEND} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{96.60} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{95.80} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{99.62} &\cellcolor[rgb]{0.949,0.949,0.949} 93.60 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{82.80} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{61.40} &\cellcolor[rgb]{0.949,0.949,0.949} 99.08 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{87.64} \\
+\cmidrule{2-10}
+& T-Patcher & 56.79 & 55.73 & 99.79 & 75.66 & 63.88 & 58.18 & 99.90 & 78.22 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{T-Patcher} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{68.27} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{66.77} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{99.92} &\cellcolor[rgb]{0.949,0.949,0.949} 74.61 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{75.83} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{65.86} &\cellcolor[rgb]{0.949,0.949,0.949} 99.87 &\cellcolor[rgb]{0.949,0.949,0.949} 74.43 \\
+\cmidrule{2-10}
+& UniKE & \textbf{100.00} & \textbf{99.75} & 80.90 & 14.70 & \textbf{100.00} & 96.35 & 84.68 & 19.38 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{UniKE} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} 99.67 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{95.59} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{18.88} &\cellcolor[rgb]{0.949,0.949,0.949} 99.66 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{99.54} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{96.57} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{19.87} \\
+\midrule
+\multirow{8}{1.7cm}{\centering\textbf{Qwen2-VL}} & WISE & 100.00 & 95.32 & 84.37 & 11.61 & 99.92 & 93.61 & 98.48 & 11.15 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{WISE} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{96.69} &\cellcolor[rgb]{0.949,0.949,0.949} 80.02 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{11.80} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{99.99} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{94.78} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{99.48} &\cellcolor[rgb]{0.949,0.949,0.949} 10.39 \\
+\cmidrule{2-10}
+& MEND & 74.16 & 76.59 & 96.51 & 71.18 & 88.73 & 89.48 & 96.12 & 66.98 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{MEND} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{74.16} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{77.78} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{96.51} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{71.18} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{90.50} &\cellcolor[rgb]{0.949,0.949,0.949} 87.62 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{97.03} &\cellcolor[rgb]{0.949,0.949,0.949} 65.46 \\
+\cmidrule{2-10}
+& T-Patcher & 78.79 & 56.03 & \textbf{98.51} & \textbf{68.62} & 73.80 & 57.39 & \textbf{98.84} & \textbf{70.69} \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{T-Patcher} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{87.83} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{83.17} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{99.03} &\cellcolor[rgb]{0.949,0.949,0.949} 46.86 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{82.39} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{63.28} &\cellcolor[rgb]{0.949,0.949,0.949} 98.74 &\cellcolor[rgb]{0.949,0.949,0.949} 60.53 \\
+\cmidrule{2-10}
+& UniKE & \textbf{100.00} & \textbf{97.51} & 41.99 & 10.17 & \textbf{100.00} & 96.64 & 58.89 & 13.21 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{UniKE} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} 97.17 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{43.51} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{10.58} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{96.83} &\cellcolor[rgb]{0.949,0.949,0.949} 57.96 &\cellcolor[rgb]{0.949,0.949,0.949} 13.09 \\
+\midrule
+\multirow{8}{1.7cm}{\centering\textbf{LLaVA-OneVision}} & WISE & 100.00 & 89.06 & 97.83 & 15.35 & 100.00 & 92.32 & 97.93 & 11.63 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{WISE} &\cellcolor[rgb]{0.949,0.949,0.949} 99.00 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{90.87} &\cellcolor[rgb]{0.949,0.949,0.949} 97.11 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{15.70} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{93.71} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{99.54} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{12.49} \\
+\cmidrule{2-10}
+& MEND & -- & -- & -- & -- & -- & -- & -- & -- \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{MEND} &\cellcolor[rgb]{0.949,0.949,0.949} -- &\cellcolor[rgb]{0.949,0.949,0.949} -- &\cellcolor[rgb]{0.949,0.949,0.949} -- &\cellcolor[rgb]{0.949,0.949,0.949} -- &\cellcolor[rgb]{0.949,0.949,0.949} -- &\cellcolor[rgb]{0.949,0.949,0.949} -- &\cellcolor[rgb]{0.949,0.949,0.949} -- &\cellcolor[rgb]{0.949,0.949,0.949} -- \\
+\cmidrule{2-10}
+& T-Patcher & 79.56 & 56.62 & 99.49 & \textbf{64.29} & \textbf{70.63} & 57.96 & 99.49 & 59.71 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{T-Patcher} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{80.51} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{68.54} &\cellcolor[rgb]{0.949,0.949,0.949} 99.47 &\cellcolor[rgb]{0.949,0.949,0.949} 63.34 &\cellcolor[rgb]{0.949,0.949,0.949} 70.37 &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{58.42} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{99.52} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{62.66} \\
+\cmidrule{2-10}
+& UniKE & \textbf{100.00} & 95.87 & 71.19 & 13.10 & \textbf{100.00} & 95.41 & 67.32 & 14.56 \\
+&\cellcolor[rgb]{0.949,0.949,0.949} ASAM\textsubscript{UniKE} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{93.02} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{15.07} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{100.00} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{93.08} &\cellcolor[rgb]{0.949,0.949,0.949} \textbf{16.58} \\
+\bottomrule
+\end{tabular}
+\end{table}

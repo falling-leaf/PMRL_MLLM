@@ -42,6 +42,51 @@ def test_expanded_swiglu_extra_down_is_nonzero_for_step_one_gradient_flow():
     assert torch.count_nonzero(expanded.extra_up.weight.grad) > 0
 
 
+def test_module_skips_stray_model_on_hf_language_model():
+    from torch import nn
+    from easyeditor.models.unike_simplified import _module
+
+    class FakeQwen(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(2, 2)])
+
+    class Wrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = FakeQwen()
+
+    wrapper = Wrapper()
+    resolved = _module(wrapper, "language_model.model.layers")
+    assert resolved is wrapper.language_model.layers
+    resolved = _module(wrapper, "language_model.layers")
+    assert resolved is wrapper.language_model.layers
+
+
+def test_minigpt4_ic_asam_uses_replace_and_rephrase_supervision():
+    from easyeditor.models.unike_simplified import UniKESimplifiedHyperParams
+    hp = UniKESimplifiedHyperParams.from_hparams("hparams/UniKE/minigpt4_ic_unike_simplified_asam.yaml")
+    assert hp.using_asam is True
+    assert hp.asam_replace is True
+    assert hp.gen_weight == 0.5
+    assert hp.image_gen_weight == 0.75
+    assert hp.asam_epsilon == 0.02
+
+
+def test_llava_unike_asam_keeps_saturated_capacity_and_adds_gen_views():
+    from easyeditor.models.unike_simplified import UniKESimplifiedHyperParams
+    for path in (
+        "hparams/UniKE/llavaov_ic_unike_asam.yaml",
+        "hparams/UniKE/llavaov_vqa_unike_asam.yaml",
+    ):
+        hp = UniKESimplifiedHyperParams.from_hparams(path)
+        assert hp.add_neuron_num == 10
+        assert hp.using_asam is True
+        assert hp.asam_replace is True
+        assert hp.gen_weight > 0
+        assert hp.image_gen_weight > 0
+
+
 def test_minigpt4_vqa_uses_explicit_vision_prompt_contract():
     source = open("easyeditor/trainer/blip2_models/mini_gpt4.py", encoding="utf-8").read()
     assert "###Human: <Img><ImageHere></Img> " in source

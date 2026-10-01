@@ -1,0 +1,20 @@
+# preedit: score the original model, apply no edit. Not an ASAM run.
+
+alg_name: "preedit"
+model_name: "/root/hugging_cache/Qwen2-VL-7B-Instruct"
+name: "/root/hugging_cache/Qwen2-VL-7B-Instruct"
+tokenizer_name: "/root/hugging_cache/Qwen2-VL-7B-Instruct"
+tokenizer_class: AutoProcessor
+device: 0
+dtype: torch.bfloat16
+sequential_edit: false
+exact_match: false
+use_chat_template: true
+file_type: image
+
+coco_image: /root/MMEdit/images
+rephrase_image: /root/MMEdit/images
+qformer_checkpoint: .
+qformer_name_or_path: .
+state_dict_file: .
+pretrained_ckpt: .

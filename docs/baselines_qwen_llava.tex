@@ -1,0 +1,26 @@
+\begin{table}[t]
+\centering
+\caption{\textbf{Unedited and training-free baselines on MMEdit.} Reliability (Rel.), Generality (Gen.), and textual and multimodal Locality (T-Loc.\ and M-Loc.) for Qwen2-VL-7B and LLaVA-OneVision-7B on Editing VQA (E-VQA) and Editing Image Caption (E-IC). Pre-edit scores the frozen model, so its locality is identically 100. IKE uses the edited fact alone ($k{=}0$, no retrieved demonstrations). FT fine-tunes the last MLP for 10 steps. All numbers are percentages over the same $N{=}100$ records.}
+\label{tab:baselines_qwen_llava}
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{ll|cccc|cccc}
+\toprule
+& & \multicolumn{4}{c|}{\textbf{E-VQA}} & \multicolumn{4}{c}{\textbf{E-IC}} \\
+\cmidrule(lr){3-6} \cmidrule(lr){7-10}
+\textbf{MLLM} & \textbf{Method}
+& \textbf{Rel.}$\uparrow$ & \textbf{Gen.}$\uparrow$ & \textbf{T-Loc.}$\uparrow$ & \textbf{M-Loc.}$\uparrow$
+& \textbf{Rel.}$\uparrow$ & \textbf{Gen.}$\uparrow$ & \textbf{T-Loc.}$\uparrow$ & \textbf{M-Loc.}$\uparrow$ \\
+\midrule
+\multirow{3}{1.7cm}{\centering\textbf{Qwen2-VL}}
+& Pre-edit & 21.28 & 17.45 & 100.00 & 100.00 & 44.85 & 43.08 & 100.00 & 100.00 \\
+& IKE       & 66.02 & 37.64 & 41.92  & 1.80   & 96.93 & 90.59 & 41.16  & 3.02   \\
+& FT        & 100.00 & 98.44 & 45.51 & 17.41  & 100.00 & 97.27 & 51.44 & 13.36  \\
+\midrule
+\multirow{3}{1.7cm}{\centering\textbf{LLaVA-OneVision}}
+& Pre-edit & 50.59 & 39.75 & 100.00 & 100.00 & 45.12 & 42.07 & 100.00 & 100.00 \\
+& IKE       & 99.42 & 90.38 & 68.68  & 1.66   & 93.06 & 87.17 & 72.39  & 2.53   \\
+& FT        & 100.00 & 98.02 & 85.43 & 30.94  & 100.00 & 96.08 & 74.59 & 14.93  \\
+\bottomrule
+\end{tabular}
+\end{table}

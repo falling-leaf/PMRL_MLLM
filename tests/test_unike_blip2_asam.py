@@ -10,8 +10,11 @@ def test_asam_config_is_explicit_and_parses():
     from easyeditor.models.unike_blip2 import UniKEBLIP2HyperParams
     p = UniKEBLIP2HyperParams.from_hparams("hparams/UniKE/blip2_ic_unike_asam.yaml")
     assert p.using_asam is True
-    assert p.asam_epsilon == 0.1
-    assert p.asam_weight == 1.0
+    assert p.asam_epsilon == 0.05
+    assert p.asam_weight == 0.25
+    assert p.asam_scale_rho == 0.1
+    assert p.asam_replace is True
+    assert p.gen_weight == 0.0
 
 
 def test_feature_shift_is_finite_under_asam_style_dtype():

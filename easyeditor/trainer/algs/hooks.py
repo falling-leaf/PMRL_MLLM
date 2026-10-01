@@ -35,9 +35,28 @@ def linear_forward_hook(mod, activations, output):
         mod.weight.__mend_x_stack__ = stack
 
 
+def clear_mend_state(model, pnames):
+    """Clear transient activation/gradient factors for the next edit."""
+    for name in pnames:
+        module = parent_module(model, name)
+        weight = module.weight
+        weight.__mend_x_stack__ = []
+        weight.__mend_pairs__ = []
+
+
+def assert_mend_state_consumed(model, pnames):
+    """Reject a partially paired multi-view backward before it leaks state."""
+    for name in pnames:
+        module = parent_module(model, name)
+        weight = module.weight
+        if getattr(weight, "__mend_x_stack__", []):
+            raise RuntimeError(f"MEND activation stack not consumed for {name}")
+
+
 def hook_model(model, pnames):
     handles = []
     for m in [parent_module(model, pname) for pname in pnames]:
+        m._mend_capture = True
         handles.append(m.register_full_backward_hook(linear_backward_hook))
         handles.append(m.register_forward_hook(linear_forward_hook))
 

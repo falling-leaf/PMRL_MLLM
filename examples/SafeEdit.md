@@ -162,7 +162,7 @@ You can download the [demo video](https://github.com/zjunlp/EasyEdit/blob/main/f
 - Click the button **Generate** of Defense Generalization: Edited Mistral-7B-v0.1 generates response for out-of-domain malicous input, which is used for Defense Generalization metric.
 
 <div align=center>
-<img src="../figs/SafeEdit_demo_gif.gif" width="70%" height="70%" />
+SafeEdit demo (animation omitted from this checkout; see the EasyEdit docs).
 </div>
 
 # 📚 Track 2 of Task 10 for NLPCC 2024

@@ -11,6 +11,7 @@ from torch.nn import CrossEntropyLoss
 from transformers.activations import ACT2FN
 from .merge import slerp, GTA, linear
 from .MMD_loss import MMD_loss
+from ...util.pmrl_utils import select_pmrl_token_views
 import torch.nn as nn
 import gc
 
@@ -1252,7 +1253,9 @@ class WISEMultimodal(WISE):
             torch.norm((view - views[0]).float()).item() > 0 for view in views[1:]
         ):
             raise RuntimeError("HF LAP produced identical adapter views")
-        flattened = [view.reshape(-1, view.size(-1)) for view in views]
+        pool_visual = bool(getattr(self.config, "pmrl_visual_pooling", False))
+        token_mask = perturb_mask if pool_visual or getattr(self.config, "using_image_embedding", False) or getattr(self.config, "lar_joint_perturbation", False) else None
+        flattened = select_pmrl_token_views(views, token_mask=token_mask, pool=pool_visual)
         representation_loss = self.pmrl_loss(
             flattened,
             tau_alignment=float(self.config.pmrl_tau_alignment),

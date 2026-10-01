@@ -107,6 +107,10 @@ class MENDMultimodalHparams(HyperParams):
     pmrl_alignment_weight: float = 1.0
     pmrl_regularization_weight: float = 0.1
     pmrl_scale: float = 1.0
+    pmrl_visual_pooling: bool = False
+    lar_target_loss_weight: float = 0.0
+    mend_extra_at_eval: bool = False
+    qwen_max_pixels: int = 1280 * 28 * 28
     mend_log_grad_diagnostics: bool = False
     
     @classmethod
@@ -117,7 +121,7 @@ class MENDMultimodalHparams(HyperParams):
 
         with open(hparams_name_or_path, "r") as stream:
             config = yaml.safe_load(stream)
-            config = super().construct_float_from_scientific_notation(config)
+            config = super().resolve_config_paths(super().construct_float_from_scientific_notation(config))
         if isinstance(config.get("dtype"), str):
             config["dtype"] = getattr(torch, config["dtype"].replace("torch.", ""))
 

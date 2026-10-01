@@ -1,0 +1,92 @@
+# LLaVA-OV MEND VQA: outer-loop ASAM, hard-capped at 10000 steps.
+# OverfitStopper (train loss rebound after step 4000) cuts the 2026-09-23
+# 10k curve at step 5400 (best basin 4400).  Replay:
+#   python scripts/mend_overfit_stop.py --log run_logs/mend_llavaov_vqa_asam_outer_10k.log
+# Launch: PMRL_MEND_HPARAMS=hparams/TRAINING/MEND/llavaov-7b-vqa-asam-outer-10k.yaml python run_mend_llavaov_vqa_train.py
+# Best weights: results/MEND_LLAVAOV_VQA_ASAM_OUTER/models/MEND/llava-onevision
+# Resume later: PMRL_MEND_RESUME=<that path | .last | .stepN>
+device: 0
+name: /root/hugging_cache/llava-onevision-qwen2-7b-ov-hf
+model_name: llava-onevision
+model_class: llava-onevision
+tokenizer_class: .
+tokenizer_name: .
+dtype: torch.bfloat16
+inner_params:
+- model.language_model.layers.27.mlp.up_proj.weight
+- model.language_model.layers.27.mlp.down_proj.weight
+alg: MEND
+lr: 1e-6
+edit_lr: 0.0001
+lr_lr: 0.0001
+seed: 42
+cedit: 0.1
+iedit: 0.1
+cloc: 1.0
+cbase: 1.0
+dropout: 0.0
+train_base: false
+no_grad_layers: null
+one_sided: false
+n_hidden: 1
+hidden_dim: null
+init: id
+norm: true
+combine: true
+x_only: false
+delta_only: false
+act: relu
+rank: 1920
+mlp_class: IDMLP
+shared: true
+archive: null
+batch_size: 1
+model_save_pt: 10000
+silent: false
+max_iters: 10000
+log_interval: 200
+eval_log_interval: 10000
+final_eval: true
+val_interval: 20000
+early_stop_patience: 20000
+early_stop_key: acc/loc_floored_val
+overfit_stop: true
+overfit_stop_key: loss/total_train
+overfit_stop_min_step: 4000
+overfit_stop_hard_max: 10000
+overfit_stop_patience_logs: 3
+overfit_stop_rel_rebound: 0.25
+overfit_stop_smooth_window: 3
+eval_only: false
+half: false
+debug: false
+save: true
+verbose: true
+val_batch_size: 1
+accumulate_bs: 2
+val_steps: 100
+opt: Adam
+grad_clip: 100.0
+results_dir: ./results/MEND_LLAVAOV_VQA_ASAM_OUTER
+exact_match: true
+qformer_checkpoint: .
+qformer_name_or_path: .
+state_dict_file: .
+coco_image: /root/MMEdit/images
+rephrase_image: /root/MMEdit/images
+using_extra: false
+using_lap: false
+using_pmrl: false
+using_image_embedding: true
+num_rephrase: 5
+using_asam: true
+asam_epsilon: 0.002
+asam_scale_rho: 0.1
+asam_replace: true
+baseline_t_loc: 0.9876358509063721
+baseline_m_loc: 0.8289788365364075
+mend_log_grad_diagnostics: false
+checkpoint_before_validation: true
+dataloader_num_workers: 0
+gpu_cache_free_threshold_gb: 8.0
+kl_chunk_size: 32

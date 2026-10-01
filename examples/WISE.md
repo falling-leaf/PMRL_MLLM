@@ -23,7 +23,7 @@ If you run into any issues with the code, you can open an issue and/or email me 
 ## 💡 Overview
 
 <div align=center>
-<img src="../figs/wise_dongtu.gif" width="100%" height="100%" />
+WISE editing demo (animation omitted from this checkout; see the EasyEdit docs).
 </div>
 
 In this paper, we point out the impossible triangle of current lifelong modeling editing approaches that reliability, generalization, and locality can hardly be achieved simultaneously. We find the reason behind this is the gap between working and long-term memory. 

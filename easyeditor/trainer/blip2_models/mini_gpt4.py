@@ -338,13 +338,24 @@ class MiniGPT4(Blip2Base):
             # print(inputs_embeds.shape, attention_mask.shape, targets.shape)
         else: 
             inputs_embeds, attention_mask, targets = self.text_encoding(samples)
-        with self.maybe_autocast():
-            outputs = self.llama_model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                return_dict=True,
-                labels=targets,
-            )
+        # The fp16 LM overflows in its last layers on recent torch builds and
+        # returns all-NaN logits. Upcast the LM for the forward only; the
+        # stored fp16 weights are put back afterwards.
+        llama = self.llama_model
+        saved = [(param, param.data) for param in llama.parameters() if param.dtype != torch.float32]
+        for param, _ in saved:
+            param.data = param.data.float()
+        try:
+            with torch.autocast("cuda", enabled=False):
+                outputs = llama(
+                    inputs_embeds=inputs_embeds.float(),
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                    labels=targets,
+                )
+        finally:
+            for param, data in saved:
+                param.data = data
         loss = outputs.loss
 
         # return {"loss": loss}

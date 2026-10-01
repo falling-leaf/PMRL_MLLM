@@ -1,0 +1,40 @@
+# FT baseline for BLIP2-OPT. Independent of ASAM / LAP / PMRL.
+# The loss is the model's own teacher-forced loss on prompt+target, with the
+# prompt masked the same way the multimodal evaluator masks it (FT-M).
+
+alg_name: "FT"
+model_name: blip2
+name: /root/hugging_cache/opt-2.7b
+tokenizer_class: GPT2Tokenizer
+tokenizer_name: /root/hugging_cache/opt-2.7b
+device: 0
+dtype: torch.float32
+
+layers: [31]
+num_steps: 10
+batch_size: 1
+max_length: 40
+lr: 5e-4
+weight_decay: 0
+kl_factor: 0
+norm_constraint: 1.0e-3
+objective_optimization: "target_new"
+rewrite_module_tmp: "opt_model.model.decoder.layers.{}.fc2.weight"
+layer_module_tmp: "opt_model.model.decoder.layers.{}"
+mlp_module_tmp: "opt_model.model.decoder.layers.{}"
+attn_module_tmp: "opt_model.model.decoder.layers.{}.self_attn"
+ln_f_module: "opt_model.model.decoder.final_layer_norm"
+lm_head_module: "opt_model.lm_head"
+model_parallel: false
+sequential_edit: false
+exact_match: true
+use_chat_template: false
+file_type: image
+
+qformer_checkpoint: /root/hugging_cache/blip2_pretrained_opt2.7b.pth
+qformer_name_or_path: /root/hugging_cache/bert-base-uncased
+state_dict_file: /root/hugging_cache/eva_vit_g.pth
+pretrained_ckpt: null
+
+coco_image: /root/MMEdit/images
+rephrase_image: /root/MMEdit/images

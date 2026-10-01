@@ -76,9 +76,32 @@ def dict_to(d, device):
     return new_dict
 
 
-def safe_backward(loss, parameters, accumulate=1, allow_unused=False):
+def move_to_device(obj, device):
+    """Recursively place every tensor in ``obj`` on ``device`` (in place).
+
+    Unlike :func:`dict_to` this also walks HF ``BatchFeature``/``BatchEncoding``
+    containers (they are ``UserDict`` subclasses, so ``isinstance(x, dict)`` is
+    False) which is what the LLaVA-OV/Qwen2-VL collate produces.  Used when the
+    collate runs inside a DataLoader worker and therefore returns CPU tensors.
+    """
+    if device is None:
+        return obj
+    if torch.is_tensor(obj):
+        return obj.to(device)
+    if hasattr(obj, "items") and callable(getattr(obj, "items")):
+        for key in list(obj.keys()):
+            obj[key] = move_to_device(obj[key], device)
+        return obj
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(move_to_device(v, device) for v in obj)
+    return obj
+
+
+def safe_backward(loss, parameters, accumulate=1, allow_unused=False, retain_graph=False):
     parameters = list(parameters)  # Capture the generator output
-    grads = torch.autograd.grad(loss, parameters, allow_unused=allow_unused)
+    grads = torch.autograd.grad(
+        loss, parameters, allow_unused=allow_unused, retain_graph=retain_graph
+    )
     nan, inf = False, False
     for g in grads:
         if g is not None:
@@ -133,6 +156,75 @@ def set_dropout(model, p):
                     n_reset += 1
 
         LOG.info(f"Set {n_reset} dropout modules to p={p}")
+
+
+def atomic_torch_save(obj, path):
+    """Write ``obj`` to ``path`` via tmp + fsync + replace so a crash cannot
+    leave a half-written checkpoint that later resume would load."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "wb") as handle:
+            torch.save(obj, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def initial_global_iter(archive):
+    """Resume step counter from a checkpoint; fresh runs start at 0."""
+    if not archive:
+        return 0
+    if "step" in archive and archive["step"] is not None:
+        return int(archive["step"])
+    return 0
+
+
+def loc_floored_score(val_info, t_floor=None, m_floor=None, floor_ratio=0.95):
+    """Sum of Rel/Gen/T-Loc/M-Loc, or -1 if locality falls under the floor.
+
+    The key name used with EarlyStopper must contain ``acc`` so higher is
+    better; rejected (loc-collapsed) candidates score -1 and cannot beat a
+    real four-metric sum in [0, 4].
+    """
+    rel = float(val_info["edit/acc_val"])
+    gen = float(val_info["image_rephrase/acc_val"])
+    t_loc = float(val_info["loc/acc_val"])
+    m_loc = float(val_info["image_loc/acc_val"])
+    loc_ok = True
+    if t_floor is not None:
+        loc_ok = loc_ok and t_loc >= float(floor_ratio) * float(t_floor)
+    if m_floor is not None:
+        loc_ok = loc_ok and m_loc >= float(floor_ratio) * float(m_floor)
+    score = rel + gen + t_loc + m_loc
+    return score if loc_ok else -1.0
+
+
+def restore_rng_state(rng_state):
+    if not rng_state:
+        return
+    if rng_state.get("torch") is not None:
+        torch.set_rng_state(rng_state["torch"])
+    cuda_state = rng_state.get("cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(cuda_state)
+        except Exception:
+            LOG.info("Could not restore CUDA RNG state; continuing with current RNG")
+    if rng_state.get("numpy") is not None:
+        np.random.set_state(rng_state["numpy"])
+
+
+def capture_rng_state():
+    return {
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy": np.random.get_state(),
+    }
 
 
 def load_archive(path):
@@ -207,6 +299,24 @@ class EarlyStopper:
     def should_stop(self):
         self._stop |= self.current_iter - self.best_iter >= self.patience
         return self._stop
+
+    def state_dict(self):
+        return {
+            "best_value": self.best_value,
+            "best_iter": self.best_iter,
+            "current_iter": self.current_iter,
+            "key": self.key,
+            "patience": self.patience,
+            "_stop": self._stop,
+        }
+
+    def load_state_dict(self, state):
+        self.best_value = state["best_value"]
+        self.best_iter = int(state["best_iter"])
+        self.current_iter = int(state["current_iter"])
+        self._stop = bool(state.get("_stop", False))
+        if "patience" in state:
+            self.patience = int(state["patience"])
 
 
 class RunningStatAverager:

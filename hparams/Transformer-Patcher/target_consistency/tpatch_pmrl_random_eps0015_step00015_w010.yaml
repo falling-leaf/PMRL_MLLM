@@ -1,0 +1,41 @@
+alg_name: Transformer-Patcher
+name: /root/hugging_cache/opt-2.7b
+model_name: blip2
+tokenizer_class: GPT2Tokenizer
+tokenizer_name: /root/hugging_cache/opt-2.7b
+device: 0
+dtype: torch.float32
+add_neuron_num: 1
+edit_lr: 0.05
+n_iter: 20
+locality_weight: 1.0
+inner_params:
+  - opt_model.model.decoder.layers.23.fc1.weight
+  - opt_model.model.decoder.layers.23.fc2.weight
+sequential_edit: false
+model_parallel: false
+use_chat_template: false
+using_extra: true
+using_lap: true
+using_pmrl: true
+using_image_embedding: true
+num_rephrase: 5
+lap_epsilon: 0.015
+pmrl_tau_alignment: 0.05
+pmrl_tau_regularization: 0.1
+pmrl_alignment_weight: 1.0
+pmrl_regularization_weight: 0.1
+pmrl_scale: 0.1
+lar_random_start: true
+lar_pgd_steps: 1
+lar_step_size: 0.0015
+lar_target_loss_weight: 0.10
+export_lap_samples: false
+exact_match: true
+qformer_checkpoint: /root/hugging_cache/blip2_pretrained_opt2.7b.pth
+qformer_name_or_path: /root/hugging_cache/bert-base-uncased
+state_dict_file: /root/hugging_cache/eva_vit_g.pth
+pretrained_ckpt: null
+file_type: image
+coco_image: /root/MMEdit/images
+rephrase_image: /root/MMEdit/images

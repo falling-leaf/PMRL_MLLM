@@ -52,6 +52,10 @@ class UniKEBLIP2HyperParams(HyperParams):
     asam_epsilon: float = 1e-3
     asam_weight: float = 1.0
     asam_visual_only: bool = True
+    asam_scale_rho: float = 0.1
+    asam_replace: bool = True
+    gen_weight: float = 0.0
+    image_gen_weight: float = 0.0
     batch_size: int = 1
     max_length: int = 30
     model_parallel: bool = False
@@ -63,9 +67,9 @@ class UniKEBLIP2HyperParams(HyperParams):
         if path.suffix != ".yaml":
             path = path.with_suffix(".yaml")
         with path.open(encoding="utf-8") as stream:
-            config = HyperParams.construct_float_from_scientific_notation(
+            config = HyperParams.resolve_config_paths(HyperParams.construct_float_from_scientific_notation(
                 yaml.safe_load(stream)
-            )
+            ))
         dtype = config.get("dtype")
         if isinstance(dtype, str):
             dtype_name = dtype.removeprefix("torch.")

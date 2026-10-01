@@ -46,6 +46,11 @@ class VQADataset(BaseDataset):
         elif "qwen2-vl" in config.model_name.lower():
             vis_processor = Qwen2VLProcessor()
             tokenizer = AutoProcessor.from_pretrained(config.name)
+            max_pixels = int(getattr(config, "qwen_max_pixels", 1280 * 28 * 28))
+            if hasattr(tokenizer, "image_processor") and tokenizer.image_processor is not None:
+                tokenizer.image_processor.max_pixels = max_pixels
+                if hasattr(tokenizer.image_processor, "size") and isinstance(tokenizer.image_processor.size, dict):
+                    tokenizer.image_processor.size["max_pixels"] = max_pixels
         elif (config is not None and hasattr(config, 'tokenizer_name')):
             tok_name = (
                 config.tokenizer_name
@@ -186,6 +191,20 @@ class VQADataset(BaseDataset):
 
             processor_kwargs = {"text": text_inputs, "return_tensors": "pt", "padding": True}
             if file_type in ["image", "single-image", "multi-image"]:
+                def _resize_for_qwen(im):
+                    if "qwen2-vl" not in model_name or im is None:
+                        return im
+                    if isinstance(im, list):
+                        return [_resize_for_qwen(x) for x in im]
+                    if not isinstance(im, Image.Image):
+                        return im
+                    longest = max(im.size)
+                    cap = 448
+                    if longest > cap:
+                        scale = cap / float(longest)
+                        im = im.resize((max(1, int(im.size[0] * scale)), max(1, int(im.size[1] * scale))), Image.BICUBIC)
+                    return im.convert("RGB")
+                images_list = [_resize_for_qwen(im) for im in images_list]
                 processor_kwargs["images"] = images_list
             multimodal_inputs = self.tok(**processor_kwargs)
 

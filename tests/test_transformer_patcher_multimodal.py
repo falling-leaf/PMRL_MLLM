@@ -123,6 +123,8 @@ def test_tpatch_hparams_define_explicit_baseline_and_pmrl_modes():
         False,
         False,
     )
+    assert baseline.using_asam is False
+    assert baseline.gen_weight == 0.0
     assert (enhanced.using_extra, enhanced.using_lap, enhanced.using_pmrl) == (
         True,
         True,
@@ -264,12 +266,13 @@ def test_tpatch_hf_model_path_is_not_treated_as_a_legacy_wrapper():
     assert patcher._is_legacy_wrapper() is True
 
 
-def test_tpatch_hf_config_parses_joint_perturbation_and_target_only_labels():
+def test_tpatch_hf_config_parses_visual_prefix_perturbation_and_target_only_labels():
     root = __import__("pathlib").Path(__file__).resolve().parents[1]
     config = TransformerPatcherMultimodalHyperParams.from_hparams(
         str(root / "hparams/Transformer-Patcher/llavaov_ic_tpatch_asam_w025.yaml")
     )
-    assert config.lar_joint_perturbation is True
+    assert config.lar_joint_perturbation is False
+    assert config.using_image_embedding is True
     assert config.objective_optimization == "only_label"
 
 

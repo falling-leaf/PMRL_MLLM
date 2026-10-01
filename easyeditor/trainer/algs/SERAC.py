@@ -153,7 +153,7 @@ class SERAC(EditableModel):
         else:
             return model_params + extra_params
 
-    def edit(self, batch, condition=None, detach_history=False):
+    def edit(self, batch, condition=None, detach_history=False, **kwargs):
         def detokenize(toks, tok):
             tokens = toks.masked_fill(toks == -100, tok.pad_token_id)
             return tok.batch_decode(tokens, skip_special_tokens=True)
@@ -371,12 +371,22 @@ class SERAC(EditableModel):
             if base_probs.size(1) != rep_cls_logits.size(1):
                 rep_cls_logits = rep_cls_logits[:, -base_probs.size(1):, :]
             rep_weight = cls_sims
-            if rep_cls_logits.device != base_probs.device:
-                rep_cls_logits = rep_cls_logits.to(base_probs.device)
             if rep_weight.device != base_probs.device:
                 rep_weight = rep_weight.to(base_probs.device)
-            if base_probs.dim() == 3:
-                mixture_logits = ((1 - rep_weight) * base_probs + rep_weight * rep_cls_logits.softmax(-1) + eps).log()
+            if rep_cls_logits.device.type == "cpu":
+                # Counterfactual logits were aligned on CPU. Softmax there and
+                # only ship one chunk of the mixture back to the card.
+                weight = rep_weight.float().cpu().view(-1, 1, 1)
+                parts = []
+                for start in range(0, base_probs.size(1), 512):
+                    end = start + 512
+                    base_slice = base_probs[:, start:end].detach().float().cpu()
+                    rep_slice = rep_cls_logits[:, start:end].softmax(-1)
+                    mixed = ((1 - weight) * base_slice + weight * rep_slice + eps).log()
+                    parts.append(mixed.to(base_probs.device, dtype=base_probs.dtype))
+                    del base_slice, rep_slice, mixed
+                del base_probs, rep_cls_logits
+                mixture_logits = torch.cat(parts, dim=1)
             else:
                 mixture_logits = ((1 - rep_weight) * base_probs + rep_weight * rep_cls_logits.sigmoid() + eps).log()
         else:
@@ -394,6 +404,32 @@ class SERAC(EditableModel):
             return mixture_logits
         else:
             return mixture_logits, cls_logits, rep_gold_logits, stats
+
+def _hf_multimodal_name(config) -> bool:
+    name = str(getattr(config, "model_name", "")).lower()
+    return "llava-onevision" in name or "qwen2-vl" in name
+
+
+def _call_hf(model, batch):
+    """Qwen2-VL / LLaVA-OV reject a BatchFeature positional arg.
+
+    BatchFeature is a UserDict, not a dict, so isinstance(batch, dict) is False.
+    """
+    items = getattr(batch, "items", None)
+    if items is None:
+        return model(batch)
+    payload = {k: v for k, v in items() if k != "labels"}
+    return model(**payload)
+
+
+def _hf_text(batch, processor):
+    """Decode a chat-templated HF batch back to the text SERAC caches."""
+    if isinstance(batch, dict) or hasattr(batch, "keys"):
+        input_ids = batch["input_ids"]
+    else:
+        input_ids = batch
+    return processor.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+
 
 class SERAC_MULTI(EditableModel):
     def __init__(self, model, config, model_constructor, classifier=None, classifier_tok=None,
@@ -426,6 +462,10 @@ class SERAC_MULTI(EditableModel):
             if config.model_name == "minigpt4":
                 self.replacement_tok = transformers.LlamaTokenizer.from_pretrained(config.small_name,)
                 self.replacement_tok.pad_token = self.replacement_tok.eos_token
+            elif _hf_multimodal_name(config):
+                # Qwen2-VL and LLaVA-OneVision share a Qwen2 language model, so the
+                # counterfactual model is a small Qwen2 (not the BLIP Q-Former path).
+                self.replacement_tok = transformers.AutoTokenizer.from_pretrained(config.small_name)
             else:
                 self.replacement_tok = transformers.AutoTokenizer.from_pretrained(config.small_name)
             if self.config.freeze_cntr:
@@ -445,6 +485,14 @@ class SERAC_MULTI(EditableModel):
                             v.requires_grad = True
                         else:
                             v.requires_grad = False
+                elif _hf_multimodal_name(config):
+                    from transformers import AutoModelForCausalLM
+                    self.replacement = AutoModelForCausalLM.from_pretrained(config.small_name)
+                    # The mixture pulls this model's logits onto CPU. Without
+                    # checkpointing, backward recomputes the whole forward once
+                    # per chunk instead of once per step.
+                    self.replacement.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs={"use_reentrant": False})
                 else:
                     self.replacement = getattr(transformers, config.model_class).from_pretrained(config.small_name)
                 if self.replacement_tok.sep_token is None and "gpt" not in config.name.lower():
@@ -464,7 +512,11 @@ class SERAC_MULTI(EditableModel):
                 self.register_buffer("scale", torch.tensor(1.0))
             else:
                 self.scale = scale
-        self.language_projection = torch.nn.Linear(self.model.Qformer.config.hidden_size, self.replacement.config.hidden_size)
+        # BLIP-2 / MiniGPT-4 project Q-Former tokens into the replacement model.
+        # Qwen2-VL and LLaVA-OneVision have no Q-Former; their counterfactual
+        # model is conditioned on the cached text only.
+        if not _hf_multimodal_name(self.config):
+            self.language_projection = torch.nn.Linear(self.model.Qformer.config.hidden_size, self.replacement.config.hidden_size)
         if cache_inputs is None:
             self.cache_inputs = []
             self.cache_labels = []
@@ -551,12 +603,23 @@ class SERAC_MULTI(EditableModel):
         else:
             return model_params + extra_params
 
-    def edit(self, batch, condition=None, detach_history=False):
+    def edit(self, batch, condition=None, detach_history=False, **kwargs):
         def detokenize(toks, tok):
             tokens = toks.masked_fill(toks == -100, tok.pad_token_id)
             return tok.batch_decode(tokens, skip_special_tokens=True)
         if self.config.model_name == "minigpt4" or self.config.model_name == "blip2":
             inputs = batch["text_input"]
+        elif _hf_multimodal_name(self.config):
+            processor = getattr(self, "processor", None)
+            if processor is None:
+                raise RuntimeError(
+                    "SERAC_MULTI on Qwen2-VL / LLaVA needs the editor processor; "
+                    "MultimodalEditor sets it before editing."
+                )
+            # The trainer's collate returns the processor batch directly.
+            # The eval editor wraps that same batch under "multimodal_inputs".
+            payload = batch["multimodal_inputs"] if "multimodal_inputs" in batch else batch
+            inputs = _hf_text(payload, processor)
         else:
             inputs = detokenize(batch["input_ids"], self.replacement_tok)
         if "bert" in self.config.name:
@@ -565,6 +628,9 @@ class SERAC_MULTI(EditableModel):
             labels = batch["labels"]
             if isinstance(labels, torch.Tensor):
                 labels = detokenize(labels, self.replacement_tok)
+        elif _hf_multimodal_name(self.config):
+            label_batch = batch["multimodal_inputs"] if "multimodal_inputs" in batch else batch
+            labels = detokenize(label_batch["labels"], self.replacement_tok)
         else:
             labels = detokenize(batch["labels"], self.replacement_tok)
 
@@ -573,6 +639,7 @@ class SERAC_MULTI(EditableModel):
 
         new_model = SERAC_MULTI(self.model, self.config, self.model_constructor, self.classifier, self.classifier_tok,
                         self.replacement, self.replacement_tok, cache_inputs, cache_labels, self.scale)
+        new_model.processor = getattr(self, "processor", None)
         new_model.train(self.training)
         return new_model, {}
 
@@ -646,6 +713,9 @@ class SERAC_MULTI(EditableModel):
         selected_contexts = [cache_contexts[idx.item()] for idx in idxs]
         if self.config.model_name == "minigpt4" or self.config.model_name == "blip2":
             test_inputs = kwargs["text_input"]
+        elif _hf_multimodal_name(self.config):
+            processor = getattr(self, "processor", None)
+            test_inputs = processor.tokenizer.batch_decode(kwargs["input_ids"], skip_special_tokens=True)
         else:
             test_inputs = self.replacement_tok.batch_decode(kwargs["input_ids"], skip_special_tokens=True)
         rep_texts = [ctx + inp for ctx, inp in zip(selected_contexts, test_inputs)]
@@ -660,11 +730,15 @@ class SERAC_MULTI(EditableModel):
             if 'labels' in kwargs.keys():
                 rep_kwargs["labels"] = kwargs["labels"]
 
-        if self.config.model_name == "minigpt4" or self.config.model_name == "blip2":
-            # Add 'ignore' labels for the prepended cache inputs
-            pre = torch.full((kwargs["labels"].shape[0], rep_kwargs["input_ids"].shape[-1] - kwargs["labels"].shape[-1]), -100,
-                             device=kwargs["labels"].device)
-            rep_kwargs["labels"] = torch.cat((pre, kwargs["labels"]), dim=-1)
+        if self.config.model_name == "minigpt4" or self.config.model_name == "blip2" or _hf_multimodal_name(self.config):
+            # Ignore the prepended cache text; only the original tokens are supervised.
+            if "labels" in kwargs:
+                gap = rep_kwargs["input_ids"].shape[-1] - kwargs["labels"].shape[-1]
+                if gap > 0:
+                    pre = torch.full((kwargs["labels"].shape[0], gap), -100, device=kwargs["labels"].device)
+                    rep_kwargs["labels"] = torch.cat((pre, kwargs["labels"]), dim=-1)
+                elif gap < 0:
+                    rep_kwargs["labels"] = kwargs["labels"][:, -rep_kwargs["input_ids"].shape[-1]:]
         # if self.config.model_name == "minigpt4":
             # rep_kwargs["labels"] = self.replacement_tok(rep_kwargs["labels"], return_tensors="pt", padding=True).to(self.config.device)["input_ids"]
             # rep_kwargs["labels"] = rep_kwargs["labels"]
@@ -674,6 +748,11 @@ class SERAC_MULTI(EditableModel):
         cache_inputs = self.build_cls_cache_inputs()
         if self.config.model_name == "minigpt4" or self.config.model_name == "blip2":
             test_inputs = inputs[0]["text_input"]
+        elif _hf_multimodal_name(self.config):
+            processor = getattr(self, "processor", None)
+            payload = inputs[0] if inputs else kwargs
+            input_ids = payload["multimodal_inputs"]["input_ids"] if "multimodal_inputs" in payload else payload["input_ids"]
+            test_inputs = processor.tokenizer.batch_decode(input_ids, skip_special_tokens=True)
         else:
             test_inputs = self.replacement_tok.batch_decode(kwargs["input_ids"], skip_special_tokens=True)
 
@@ -716,22 +795,24 @@ class SERAC_MULTI(EditableModel):
 
         # need to do soft mixing of logits if we're doing supervised training or we've specifically requested it
         soft = (not self.config.supervised) or self.config.soft_weighting
+        final_labels = None
+        final_att_mask = None
         with torch.no_grad():
             if len(self.cache_inputs) == 0:
                 if self.config.model_name == "blip2" or self.config.model_name == "minigpt4":
                     super_out = self.model(*inputs, **kwargs)
+                elif _hf_multimodal_name(self.config):
+                    super_out = _call_hf(self.model, inputs[0] if inputs else kwargs)
                 else:
                     super_out = super().forward(*inputs, **kwargs).float()
                 torch.set_grad_enabled(grad_enabled)
                 return super_out
             else:
-                if self.config.model_name == "blip2" or self.config.model_name == "minigpt4":
-                    # if "prompts_len" in kwargs:
-                    #     prompts_len = kwargs.pop("prompts_len")
-                    base_logits = self.model(*inputs, **kwargs)
+                if self.config.model_name == "blip2" or self.config.model_name == "minigpt4" or _hf_multimodal_name(self.config):
+                    base_logits = self.model(*inputs, **kwargs) if not _hf_multimodal_name(self.config) else _call_hf(self.model, inputs[0] if inputs else kwargs)
                     if not isinstance(base_logits, torch.Tensor):
-                        final_labels = base_logits.labels
-                        final_att_mask = base_logits.attention_mask
+                        final_labels = base_logits.labels if hasattr(base_logits, "labels") else None
+                        final_att_mask = getattr(base_logits, "attention_mask", None)
                         base_logits = base_logits.logits
                     base_logits = base_logits.float()
                 else:
@@ -746,6 +827,10 @@ class SERAC_MULTI(EditableModel):
         cls_sims, cls_idxs, cls_logits = self.run_classifier(*inputs, **kwargs)
         if self.config.model_name == "minigpt4" or self.config.model_name == "blip2":
             rep_cls_inputs = self.build_rep_input_tokens(inputs[0], cls_idxs)
+        elif _hf_multimodal_name(self.config):
+            payload = inputs[0] if inputs else kwargs
+            rep_source = payload["multimodal_inputs"] if "multimodal_inputs" in payload else payload
+            rep_cls_inputs = self.build_rep_input_tokens(rep_source, cls_idxs)
         else:
             rep_cls_inputs = self.build_rep_input_tokens(kwargs, cls_idxs)
         if self.config.freeze_cntr:
@@ -850,6 +935,53 @@ class SERAC_MULTI(EditableModel):
                 else:
                     rep_cls_logits = _logits(self.replacement(**rep_cls_inputs))
                 rep_cls_logits = rep_cls_logits[:, -base_probs.shape[1]:, :]
+            elif _hf_multimodal_name(self.config):
+                # The small Qwen2 sees cached text, not vision tokens, so its
+                # sequence is shorter and its vocabulary lacks the ~192 vision
+                # tokens. Align both on the card; 85GB fits the full tensor.
+                rep_cls_logits = _logits(self.replacement(**rep_cls_inputs))
+                length_gap = base_probs.size(1) - rep_cls_logits.size(1)
+                if length_gap > 0:
+                    rep_cls_logits = torch.nn.functional.pad(rep_cls_logits, (0, 0, length_gap, 0), value=-1e4)
+                elif length_gap < 0:
+                    rep_cls_logits = rep_cls_logits[:, -base_probs.size(1):, :]
+                vocab_gap = base_probs.size(-1) - rep_cls_logits.size(-1)
+                if vocab_gap > 0:
+                    rep_cls_logits = torch.nn.functional.pad(rep_cls_logits, (0, vocab_gap), value=-1e4)
+                # The edit loss and the KL only read a handful of positions, but
+                # the softmax below is over the whole sequence and backward
+                # recomputes it once per position. Reduce to the kept rows and
+                # scatter the mixture back, so the graph only covers those rows.
+                payload = inputs[0] if inputs else kwargs
+                keep = None
+                if isinstance(payload, dict) or hasattr(payload, "keys"):
+                    # Restrict to the supervised answer tokens. The attention
+                    # mask covers the whole ~3000-token prompt, and softmaxing
+                    # it made one step take many minutes. The KL then only sees
+                    # the answer positions too, which is the part that matters.
+                    lab = payload.get("labels")
+                    if lab is not None and lab.shape[:2] == base_probs.shape[:2]:
+                        keep = lab != -100
+                if keep is not None and int(keep.sum()) > 0:
+                    batch_size, seq_len, vocab = base_probs.shape
+                    rows = keep.reshape(-1)
+                    rep_kept = rep_cls_logits.reshape(-1, vocab)[rows]
+                    base_kept = base_probs.reshape(-1, vocab)[rows]
+                    # cls_sims is one weight per batch element; expand it over
+                    # that element's kept rows.
+                    which = torch.arange(batch_size, device=keep.device).view(-1, 1).expand_as(keep).reshape(-1)[rows]
+                    w = cls_sims.view(-1).to(rep_kept.dtype)[which].unsqueeze(-1)
+                    mixed_kept = ((1 - w) * base_kept + w * rep_kept.softmax(-1) + eps).log()
+                    # Start from the base distribution so the unsupervised
+                    # positions contribute nothing to the KL, then overwrite
+                    # only the rows the loss actually reads.
+                    mixed = base_probs.detach().clone()
+                    mixed.view(-1, vocab)[rows] = mixed_kept.to(mixed.dtype)
+                    rep_cls_logits = mixed
+                    self._hf_mixed = True
+                if not getattr(self, "_logged_keep", False):
+                    LOG.info("SERAC reduced to %s positions", int(keep.sum()) if keep is not None else "all")
+                    self._logged_keep = True
             else:
                 rep_cls_logits = _logits(self.replacement(**rep_cls_inputs))
 
@@ -878,16 +1010,30 @@ class SERAC_MULTI(EditableModel):
         # if hasattr(self.model, "name_or_path") and "gpt" in self.model.name_or_path.lower():
         #     rep_cls_logits = rep_cls_logits[:, -kwargs["labels"].shape[-1]:, :]
 
-        if soft:
+        if soft and getattr(self, "_hf_mixed", False):
+            # Already mixed over the supervised rows only; see the HF branch.
+            mixture_logits = rep_cls_logits
+            self._hf_mixed = False
+        elif soft:
             if base_probs.size(1) != rep_cls_logits.size(1):
                 rep_cls_logits = rep_cls_logits[:, -base_probs.size(1):, :]
             rep_weight = cls_sims
-            if rep_cls_logits.device != base_probs.device:
-                rep_cls_logits = rep_cls_logits.to(base_probs.device)
             if rep_weight.device != base_probs.device:
                 rep_weight = rep_weight.to(base_probs.device)
-            if base_probs.dim() == 3:
-                mixture_logits = ((1 - rep_weight) * base_probs + rep_weight * rep_cls_logits.softmax(-1) + eps).log()
+            if rep_cls_logits.device.type == "cpu":
+                # Counterfactual logits were aligned on CPU. Softmax there and
+                # only ship one chunk of the mixture back to the card.
+                weight = rep_weight.float().cpu().view(-1, 1, 1)
+                parts = []
+                for start in range(0, base_probs.size(1), 512):
+                    end = start + 512
+                    base_slice = base_probs[:, start:end].detach().float().cpu()
+                    rep_slice = rep_cls_logits[:, start:end].softmax(-1)
+                    mixed = ((1 - weight) * base_slice + weight * rep_slice + eps).log()
+                    parts.append(mixed.to(base_probs.device, dtype=base_probs.dtype))
+                    del base_slice, rep_slice, mixed
+                del base_probs, rep_cls_logits
+                mixture_logits = torch.cat(parts, dim=1)
             else:
                 mixture_logits = ((1 - rep_weight) * base_probs + rep_weight * rep_cls_logits.sigmoid() + eps).log()
         else:
@@ -902,6 +1048,9 @@ class SERAC_MULTI(EditableModel):
 
         torch.set_grad_enabled(grad_enabled)
         if return_logits_only:
+            if _hf_multimodal_name(self.config):
+                from transformers.modeling_outputs import CausalLMOutputWithPast
+                return CausalLMOutputWithPast(logits=mixture_logits)
             from ..blip2_models.mini_gpt4 import MiniGPTOutput
             return MiniGPTOutput(
                     logits=mixture_logits,

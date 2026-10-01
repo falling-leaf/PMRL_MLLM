@@ -51,6 +51,17 @@ class TransformerPatcherMultimodalHyperParams(HyperParams):
     lar_joint_perturbation: bool = False
     # Apply edit-target CE to each local view; never consumes image-rephrase labels.
     lar_target_loss_weight: float = 0.0
+    pmrl_visual_pooling: bool = False
+    # Parameter-space ASAM over the added neurons.  Off by default so frozen
+    # baselines stay bitwise identical to the previous optimizer path.
+    using_asam: bool = False
+    asam_epsilon: float = 0.05
+    asam_weight: float = 1.0
+    asam_scale_rho: float = 0.1
+    asam_replace: bool = True
+    # Extra CE on the official text rephrase (Gen-T) and image rephrase (Gen-M).
+    gen_weight: float = 0.0
+    image_gen_weight: float = 0.0
     # Shared HF tokenizer requires an explicit target-only-label protocol.
     objective_optimization: str = "only_label"
     adam_eps: float = 1e-8
@@ -65,7 +76,7 @@ class TransformerPatcherMultimodalHyperParams(HyperParams):
         if not hparams_name_or_path.endswith(".yaml"):
             hparams_name_or_path += ".yaml"
         with open(hparams_name_or_path, encoding="utf-8") as stream:
-            config = HyperParams.construct_float_from_scientific_notation(yaml.safe_load(stream))
+            config = HyperParams.resolve_config_paths(HyperParams.construct_float_from_scientific_notation(yaml.safe_load(stream)))
         dtype = config.get("dtype")
         if isinstance(dtype, str):
             dtype_name = dtype.removeprefix("torch.")
